@@ -30,8 +30,13 @@ jobs:
       - name: Cargo check
         run: cargo check
 
-      - name: Build native extension
-        run: maturin develop --release
+      - name: Build wheel
+        run: maturin build --release
 
+      - name: Install wheel
+        shell: pwsh
+        run: |
+          $wheel = Get-ChildItem target/wheels/*.whl | Select-Object -First 1
+          python -m pip install $wheel.FullName
       - name: Run tests
         run: python -m pytest -q
