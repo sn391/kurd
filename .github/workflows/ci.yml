@@ -38,5 +38,11 @@ jobs:
         run: |
           $wheel = Get-ChildItem target/wheels/*.whl | Select-Object -First 1
           python -m pip install $wheel.FullName
-      - name: Run tests
-        run: python -m pytest -q
+      
+      - name: Run tests against installed wheel
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\kurd-tests"
+          Copy-Item -Recurse tests "$env:RUNNER_TEMP\kurd-tests\tests"
+          Set-Location "$env:RUNNER_TEMP\kurd-tests"
+          python -m pytest -q
