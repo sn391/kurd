@@ -8,7 +8,15 @@ on:
 
 jobs:
   test:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-latest
+          - ubuntu-latest
+          - macos-latest
+
+    runs-on: ${{ matrix.os }}
 
     steps:
       - name: Checkout
@@ -22,7 +30,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install Python dependencies
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install maturin pytest
@@ -34,13 +42,30 @@ jobs:
         run: maturin build --release
 
       - name: Install wheel
+        shell: bash
+        if: runner.os != 'Windows'
+        run: |
+          python -m pip install target/wheels/*.whl
+
+      - name: Install wheel on Windows
         shell: pwsh
+        if: runner.os == 'Windows'
         run: |
           $wheel = Get-ChildItem target/wheels/*.whl | Select-Object -First 1
           python -m pip install $wheel.FullName
-      
-      - name: Run tests against installed wheel
+
+      - name: Test installed wheel
+        shell: bash
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p "$RUNNER_TEMP/kurd-tests"
+          cp -R tests "$RUNNER_TEMP/kurd-tests/"
+          cd "$RUNNER_TEMP/kurd-tests"
+          python -m pytest -q
+
+      - name: Test installed wheel on Windows
         shell: pwsh
+        if: runner.os == 'Windows'
         run: |
           New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\kurd-tests"
           Copy-Item -Recurse tests "$env:RUNNER_TEMP\kurd-tests\tests"
