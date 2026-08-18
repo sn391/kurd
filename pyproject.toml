@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "kurd"
-version = "0.1.2"
+version = "0.2.0"
 description = "The high-performance MCP gateway with Rust core."
 authors = [
     { name = "Semko Kermashani", email = "sn391@yahoo.com" }
