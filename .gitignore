@@ -1,0 +1,13 @@
+.venv/
+.test-venv/
+.release-test/
+__pycache__/
+target/
+*.pyc
+*.pyd
+*.so
+*.dll
+*.pdb
+kurd-mcp.zip
+async_server.py
+schema_server.py

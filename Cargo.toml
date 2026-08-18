@@ -1,0 +1,19 @@
+[package]
+name = "kurd"
+version = "0.1.1"
+edition = "2021"
+
+[lib]
+name = "_kurd"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.29", features = ["extension-module"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
+axum = "0.8"
+hyper = "1"
+tower = "0.5"
+once_cell = "1"
