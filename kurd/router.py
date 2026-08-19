@@ -7,8 +7,15 @@ from typing import Callable, Dict, Any, Coroutine
 from kurd._kurd import (
     fast_parse,
     register_tool,
+    register_upstream,
+    unregister_upstream,
+    clear_tools_cache,
+    set_runtime_limits,
+    set_request_logging,
+    runtime_status,
     init_python_async_runtime,
 )
+
 
 def _python_type_to_schema(annotation):
     origin = get_origin(annotation)
@@ -55,6 +62,68 @@ class Router:
     def __init__(self):
         self._tools: Dict[str, Callable[..., Coroutine[Any, Any, Any]]] = {}
         init_python_async_runtime()
+
+    def mount(self, name: str, url: str) -> None:
+        if not name:
+            raise ValueError("Upstream name cannot be empty")
+
+        if not url:
+            raise ValueError("Upstream URL cannot be empty")
+
+        register_upstream(name, url)
+
+    def unmount(self, name: str) -> bool:
+        if not name:
+            raise ValueError("Upstream name cannot be empty")
+
+        return unregister_upstream(name)
+
+    def refresh_tools(self) -> None:
+        clear_tools_cache()
+
+    def configure_runtime(
+        self,
+        *,
+        global_concurrency: int = 512,
+        upstream_concurrency: int = 64,
+        python_concurrency: int = 64,
+        request_logging: bool = False,
+    ) -> None:
+        """Configure production backpressure and request logging."""
+        set_runtime_limits(
+            global_concurrency,
+            upstream_concurrency,
+            python_concurrency,
+        )
+        set_request_logging(request_logging)
+
+    def runtime_status(self) -> dict:
+        """Return a lightweight snapshot of runtime/backpressure counters."""
+        (
+            global_limit,
+            upstream_limit,
+            python_limit,
+            active_requests,
+            peak_active_requests,
+            total_requests,
+            completed_requests,
+            rejected_requests,
+            python_rejections,
+            request_logging_enabled,
+        ) = runtime_status()
+
+        return {
+            "globalConcurrencyLimit": global_limit,
+            "upstreamConcurrencyLimit": upstream_limit,
+            "pythonConcurrencyLimit": python_limit,
+            "activeRequests": active_requests,
+            "peakActiveRequests": peak_active_requests,
+            "totalRequests": total_requests,
+            "completedRequests": completed_requests,
+            "rejectedRequests": rejected_requests,
+            "pythonRejectedCalls": python_rejections,
+            "requestLoggingEnabled": request_logging_enabled,
+        }
 
     def tool(self, name: str = None):
         """Decorator to register asynchronous tools."""
@@ -127,7 +196,9 @@ class Router:
             # Step 2: Execute tool with parameter validation
             tool_func = self._tools[method]
             try:
-                result = await tool_func(**params)
+                result = tool_func(**params)
+                if inspect.isawaitable(result):
+                    result = await result
             except TypeError as te:
                 return json.dumps({
                     "jsonrpc": "2.0",

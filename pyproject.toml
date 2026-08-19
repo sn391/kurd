@@ -4,15 +4,27 @@ build-backend = "maturin"
 
 [project]
 name = "kurd"
-version = "0.2.0"
-description = "The high-performance MCP gateway with Rust core."
+version = "0.3.0"
+description = "High-performance Model Context Protocol gateway for Python powered by Rust."
 authors = [
     { name = "Semko Kermashani", email = "sn391@yahoo.com" }
 ]
 license = { text = "MIT" }
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 dependencies = []
+keywords = ["mcp", "model-context-protocol", "gateway", "rust", "python", "ai"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "Topic :: Software Development :: Libraries",
+]
 
 [project.urls]
 Homepage = "https://github.com/sn391/kurd"

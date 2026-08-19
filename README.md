@@ -2,21 +2,37 @@
 
 A high-performance Model Context Protocol (MCP) gateway for Python, powered by Rust.
 
+Kurd combines a Python-first developer API with a Rust data plane for MCP routing, upstream aggregation, concurrency control, security, caching, and observability.
+
 ## Status
 
-Kurd is currently in early development.
+Kurd is in **beta** and is being hardened for production use.
 
-The public API and internal architecture may change before the first stable release.
+Current release line: **0.3.x**
+
+The gateway targets the MCP **2026-07-28** protocol revision while preserving compatibility paths used by existing Kurd applications.
 
 ## Highlights
 
-- Python-first developer experience
-- Rust-powered native core
-- Fast JSON-RPC preprocessing
-- Async routing support
-- Native extension built with PyO3
-- Packaging and distribution with Maturin
-- Designed for high-throughput MCP workloads
+- Python-first `Router` API
+- Rust core using Tokio, Axum, Serde, and Reqwest
+- MCP `server/discover`, `tools/list`, and `tools/call`
+- Local Python tools and mounted upstream MCP servers
+- Sync and async Python callbacks
+- Concurrent upstream discovery
+- Shared HTTP connection pool
+- Retry with exponential backoff and jitter
+- Circuit breaker
+- Tool-list caching with TTL and cache scope
+- Graceful HTTP lifecycle: start, stop, status, restart
+- Optional bearer authentication
+- Request-size and content-type validation
+- Upstream URL validation and private-network policy
+- Configurable upstream timeout
+- Global, per-upstream, and Python callback backpressure
+- Request IDs and structured request logging
+- Runtime, cache, and upstream metrics
+- Cross-platform CI and automated PyPI release workflow
 
 ## Installation
 
@@ -24,7 +40,7 @@ The public API and internal architecture may change before the first stable rele
 pip install kurd
 ```
 
-> Kurd is currently in early development. Platform-specific wheels may not yet be available for every Python version and operating system.
+Python 3.10 or newer is required.
 
 ## Quick Start
 
@@ -33,441 +49,252 @@ from kurd import Router
 
 router = Router()
 
-
-@router.tool(name="ping")
-async def ping(value: int):
-    return value + 1
+@router.tool()
+async def add(a: int, b: int) -> int:
+    return a + b
 ```
 
-## JSON-RPC Dispatch
-
-Kurd can route JSON-RPC requests to registered asynchronous Python tools.
+Start the HTTP gateway:
 
 ```python
-import asyncio
+from kurd._kurd import start_http_gateway
 
-from kurd import Router
-
-
-router = Router()
-
-
-@router.tool(name="add")
-async def add(a: int, b: int):
-    return a + b
-
-
-async def main():
-    response = await router.dispatch(
-        '{"jsonrpc":"2.0","id":1,"method":"add","params":{"a":2,"b":3}}'
-    )
-
-    print(response)
-
-
-asyncio.run(main())
+start_http_gateway("127.0.0.1:9200")
 ```
 
-Example response:
-
-```json
-{
-  "jsonrpc": "2.0",
-  "result": 5,
-  "id": "1"
-}
-```
-
-## Architecture
-
-Kurd uses a hybrid Python and Rust architecture.
+The MCP endpoint is:
 
 ```text
-Python API
-    |
-    v
-Kurd Router
-    |
-    v
-PyO3
-    |
-    v
-Rust Core
-    |
-    v
-JSON-RPC Processing
+http://127.0.0.1:9200/mcp
 ```
 
-Python provides the developer-facing API, while performance-sensitive parsing and preprocessing are handled by the Rust core.
+Health and operational status are exposed at:
+
+```text
+GET /health
+GET /status
+```
+
+## Mount an Upstream MCP Server
+
+```python
+from kurd import Router
+
+router = Router()
+router.mount("github", "http://127.0.0.1:9300")
+```
+
+An upstream tool named `create_issue` is exposed through Kurd as:
+
+```text
+github.create_issue
+```
+
+Unmount or refresh the aggregated tool cache:
+
+```python
+router.unmount("github")
+router.refresh_tools()
+```
+
+## Runtime Hardening
+
+Kurd provides explicit concurrency controls:
+
+```python
+router.configure_runtime(
+    global_concurrency=512,
+    upstream_concurrency=64,
+    python_concurrency=64,
+    request_logging=False,
+)
+```
+
+Inspect runtime state:
+
+```python
+print(router.runtime_status())
+```
+
+The HTTP `/status` endpoint also reports runtime, cache, security, upstream latency, retry, and circuit-breaker metrics.
+
+## Security
+
+Kurd currently provides a production security baseline:
+
+- maximum MCP request body size
+- JSON content-type validation
+- optional bearer-token authentication
+- upstream URL validation
+- configurable private/loopback upstream policy
+- configurable upstream request timeout
+- sanitized upstream transport errors
+- overload rejection through explicit backpressure
+
+For deployments exposed beyond localhost, use TLS at the reverse proxy or ingress layer and apply your normal network-level authentication and authorization controls.
+
+## MCP 2026-07-28
+
+Kurd implements the stateless 2026 MCP model used for routable gateway traffic:
+
+- per-request protocol metadata
+- `MCP-Protocol-Version`
+- `Mcp-Method`
+- `Mcp-Name` for tool calls
+- `server/discover`
+- deterministic `tools/list`
+- `resultType`
+- `ttlMs`
+- `cacheScope`
+- server identity metadata
+
+Kurd rejects mismatched modern MCP headers and unsupported protocol versions.
 
 ## Performance
 
-Early local microbenchmarks show that Kurd's Rust JSON-RPC preprocessing path can outperform an equivalent pure-Python implementation.
+The repository includes end-to-end HTTP load tests in `tests/test_load.py`.
 
-Current measurements are experimental and should not yet be interpreted as production performance guarantees.
+Example measurements from a Windows development machine:
 
-Benchmarking is being performed with tools such as `pyperf` to measure:
+| Scenario | Concurrency | Throughput | p50 | p95 | p99 | Errors |
+|---|---:|---:|---:|---:|---:|---:|
+| Local Python tool | 10 | 594.5 req/s | 14.94 ms | 23.88 ms | 28.66 ms | 0% |
+| Local Python tool | 50 | 587.9 req/s | 33.29 ms | 87.83 ms | 119.09 ms | 0% |
+| Local Python tool | 100 | 556.0 req/s | 18.27 ms | 29.52 ms | 32.43 ms | 0% |
+| Upstream tool | 10 | 412.2 req/s | 21.77 ms | 36.35 ms | 42.74 ms | 0% |
+| Upstream tool | 50 | 229.8 req/s | 20.61 ms | 534.61 ms | 549.25 ms | 0% |
+| Upstream tool | 100 | 293.6 req/s | 30.12 ms | 531.40 ms | 535.34 ms | 0% |
+| Local sustained burst | 100 | 573.3 req/s | 73.51 ms | 179.13 ms | 218.49 ms | 0% |
 
-- throughput
-- average latency
-- p50 latency
-- p95 latency
-- p99 latency
-- Python vs. Rust preprocessing performance
+These are local measurements, not universal performance guarantees. Hardware, operating system, Python version, payload shape, upstream implementation, and network conditions affect results.
 
-Reproducible benchmark results will be published as the project matures.
+Run the benchmark suite with:
+
+```bash
+python -m pytest tests/test_load.py -q -s
+```
 
 ## Development
 
-Kurd requires Python and Rust.
-
-Recommended development environment:
-
-```text
-Python 3.12+
-Rust stable
-Maturin
-PyO3
-```
-
-Create a virtual environment:
+Create and activate a virtual environment, then install the development tools:
 
 ```bash
-python -m venv .venv
+python -m pip install --upgrade pip
+python -m pip install maturin pytest
 ```
 
-Activate it on Windows PowerShell:
-
-```powershell
-.\.venv\Scripts\Activate.ps1
-```
-
-Install Maturin:
-
-```bash
-python -m pip install maturin
-```
-
-Build and install Kurd in development mode:
+Build the native extension:
 
 ```bash
 maturin develop --release
 ```
 
-Run the test suite:
+Run the full test suite:
 
 ```bash
 python -m pytest -q
 ```
 
-Build a release wheel:
+Build release artifacts:
 
 ```bash
 maturin build --release
 ```
 
+## Architecture
+
+```text
+Python application
+       |
+       v
+   Kurd Router
+       |
+       v
+   PyO3 boundary
+       |
+       v
+ Rust MCP gateway
+   |          |
+   |          +--> Local Python tools
+   |
+   +-------------> Upstream MCP servers
+```
+
+Rust owns the HTTP server, MCP validation, routing, caching, retries, circuit breaking, backpressure, and operational metrics. Python provides the developer-facing registration and configuration API.
+
+## Testing
+
+The current suite covers:
+
+- JSON-RPC parsing and dispatch
+- local sync and async tools
+- upstream discovery and calls
+- concurrent upstream discovery
+- cache behavior and invalidation
+- mount and unmount
+- MCP 2026 request headers and protocol-version checks
+- HTTP lifecycle and graceful shutdown
+- request-size and content-type security
+- bearer authentication
+- upstream URL policy
+- timeout configuration
+- error sanitization
+- global and Python callback backpressure
+- request ID propagation
+- runtime observability
+- load and burst behavior
+
+## Compatibility
+
+CI targets Windows, Linux, and macOS. Release wheels are built through Maturin.
+
+The project is primarily developed with Python 3.12 and stable Rust; package metadata supports Python 3.10+.
+
+## Release Policy
+
+Kurd uses semantic versioning while the public API stabilizes.
+
+- patch releases: bug fixes and packaging corrections
+- minor releases: new gateway or MCP capabilities
+- `1.0.0`: stable public API commitment
+
 ## Project Structure
 
 ```text
-kurd-mcp/
+kurd/
 ├── kurd/
 │   ├── __init__.py
-│   ├── router.py
-│   └── _kurd.*
-│
+│   └── router.py
 ├── src/
 │   └── lib.rs
-│
 ├── tests/
-│
-├── benchmarks/
-│
+│   ├── test_upstream.py
+│   ├── test_load.py
+│   └── upstream_server.py
 ├── Cargo.toml
 ├── pyproject.toml
 ├── README.md
 └── LICENSE
 ```
 
-## Benchmarking
-
-Kurd includes benchmark work focused on comparing the Rust preprocessing path against equivalent pure-Python processing.
-
-Example local `pyperf` measurements:
-
-```text
-Python: 5.92 us
-Rust:   2.26 us
-Speedup: 2.62x
-```
-
-These numbers are preliminary local microbenchmarks and are not production performance guarantees.
-
-Performance may vary depending on:
-
-- CPU architecture
-- Python version
-- operating system
-- payload size
-- batch size
-- system load
-- compiler configuration
-- Rust optimization level
-
-Future benchmarks will include reproducible cross-platform measurements.
-
-## Roadmap
-
-Planned areas of development include:
-
-- MCP-native routing
-- Streamable HTTP transport
-- connection management
-- request routing
-- concurrency control
-- backpressure
-- timeouts and cancellation
-- upstream health checks
-- observability
-- structured error handling
-- improved Python type support
-- cross-platform wheels
-- automated CI/CD releases
-- benchmark automation
-- Linux, macOS, and Windows performance testing
-
-## Design Goals
-
-Kurd is being designed around several core principles:
-
-### Python Ergonomics
-
-Developers should interact with Kurd through a simple and familiar Python API.
-
-### Rust Performance
-
-Performance-sensitive protocol processing should be handled by native Rust code whenever doing so provides a measurable benefit.
-
-### Minimal Python/Rust Boundary Overhead
-
-Data should cross the Python/Rust boundary only when necessary.
-
-Parsing data in Rust and immediately serializing it back into JSON for Python to parse again should be avoided.
-
-### MCP-Native Architecture
-
-Kurd is intended to evolve into an MCP-aware gateway rather than remain only a generic JSON-RPC router.
-
-### Measurable Performance
-
-Performance claims should be supported by reproducible benchmarks rather than theoretical assumptions.
-
-## Technology Stack
-
-Kurd currently uses:
-
-- Python
-- Rust
-- PyO3
-- Maturin
-- Tokio
-- Serde
-- serde_json
-- pytest
-- pyperf
-
-## Python API
-
-The public API is intended to remain Python-friendly.
-
-Example:
-
-```python
-from kurd import Router
-
-router = Router()
-
-
-@router.tool()
-async def multiply(a: int, b: int):
-    return a * b
-```
-
-Requests can then be dispatched through the router:
-
-```python
-response = await router.dispatch(
-    """
-    {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "multiply",
-        "params": {
-            "a": 4,
-            "b": 5
-        }
-    }
-    """
-)
-```
-
-## Error Handling
-
-Kurd currently supports basic JSON-RPC error responses, including:
-
-```text
--32700  Parse error
--32601  Method not found
--32602  Invalid params
--32603  Internal error
-```
-
-Error handling will continue to evolve as MCP protocol support becomes more complete.
-
-## Building From Source
-
-Clone the repository:
-
-```bash
-git clone https://github.com/sn391/kurd.git
-cd kurd
-```
-
-Create a virtual environment:
-
-```bash
-python -m venv .venv
-```
-
-Activate it:
-
-```powershell
-.\.venv\Scripts\Activate.ps1
-```
-
-Install development dependencies:
-
-```bash
-python -m pip install --upgrade pip
-python -m pip install maturin pytest pyperf
-```
-
-Build the Rust extension:
-
-```bash
-maturin develop --release
-```
-
-Run tests:
-
-```bash
-python -m pytest -q
-```
-
-Build a distributable wheel:
-
-```bash
-maturin build --release
-```
-
-Generated wheels are placed under:
-
-```text
-target/wheels/
-```
-
-## Testing
-
-Run the complete test suite with:
-
-```bash
-python -m pytest -q
-```
-
-Current tests cover areas such as:
-
-- package import
-- Rust extension availability
-- valid JSON parsing
-- invalid JSON parsing
-- parameter extraction
-- router dispatch
-- method-not-found handling
-- invalid parameters
-- internal errors
-
-Additional integration and transport tests will be added as the project develops.
-
-## Package Layout
-
-Kurd is a mixed Python/Rust package.
-
-The Python package exposes the developer-facing API:
-
-```text
-kurd/
-├── __init__.py
-├── router.py
-└── _kurd.*
-```
-
-The native extension is implemented in Rust:
-
-```text
-src/
-└── lib.rs
-```
-
-The private native module is exposed internally as:
-
-```python
-kurd._kurd
-```
-
-Users should generally interact with the public API exposed by:
-
-```python
-import kurd
-```
-
-rather than depending directly on private native implementation details.
-
-## Compatibility
-
-The project is currently being developed and tested primarily with:
-
-```text
-Python 3.12
-Windows x86-64
-Rust stable
-```
-
-Support for additional Python versions, operating systems, and architectures will be added through automated wheel builds.
-
 ## Contributing
 
-Kurd is currently in an early development phase.
+Issues and technical discussions are welcome through the GitHub issue tracker.
 
-Contribution guidelines will be added as the public API and architecture stabilize.
+Before submitting a change:
 
-For bugs, ideas, and technical discussions, use the GitHub issue tracker:
-
-```text
-https://github.com/sn391/kurd/issues
+```bash
+cargo check
+maturin develop --release
+python -m pytest -q
 ```
-
-## Security
-
-Kurd is not yet considered production-ready.
-
-If you discover a security issue, avoid publishing sensitive exploit details in a public issue.
-
-A dedicated security policy and private vulnerability reporting process will be added as the project approaches production readiness.
 
 ## License
 
-Kurd is released under the MIT License.
+MIT.
 
 ## Name
 
 The name **Kurd** honors Kurdish identity and heritage.
-Bezhi Kurd u Kurdistan
+
+Bezhi Kurd u Kurdistan.

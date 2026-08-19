@@ -1,7 +1,10 @@
 [package]
 name = "kurd"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
+license = "MIT"
+description = "High-performance MCP gateway for Python powered by Rust."
+repository = "https://github.com/sn391/kurd"
 
 [lib]
 name = "_kurd"
@@ -13,6 +16,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.0", features = ["full"] }
 pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
+reqwest = { version = "0.12", features = ["json"] }
+rand = "0.9"
 axum = "0.8"
 hyper = "1"
 tower = "0.5"
