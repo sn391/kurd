@@ -100,7 +100,7 @@ jobs:
           command: sdist
           maturin-version: v1.11.5
           rust-toolchain: stable
-          args: --locked --out dist
+          args: --out dist
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
