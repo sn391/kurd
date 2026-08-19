@@ -10,24 +10,21 @@ permissions:
 
 jobs:
   linux:
-    name: Linux wheels
+    name: Linux wheel
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
       - name: Build Linux wheel
         uses: PyO3/maturin-action@v1
         with:
           command: build
+          maturin-version: v1.11.5
+          rust-toolchain: stable
           manylinux: "2_28"
-          args: --release --out dist -i python3.12
+          args: --release --locked --out dist --compatibility pypi -i python3.12
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -36,7 +33,7 @@ jobs:
           path: dist/*
 
   windows:
-    name: Windows wheels
+    name: Windows wheel
     runs-on: windows-latest
 
     steps:
@@ -52,7 +49,9 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           command: build
-          args: --release --out dist --compatibility pypi
+          maturin-version: v1.11.5
+          rust-toolchain: stable
+          args: --release --locked --out dist --compatibility pypi -i python3.12
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -61,7 +60,7 @@ jobs:
           path: dist/*
 
   macos:
-    name: macOS wheels
+    name: macOS wheel
     runs-on: macos-latest
 
     steps:
@@ -77,7 +76,9 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           command: build
-          args: --release --out dist --compatibility pypi
+          maturin-version: v1.11.5
+          rust-toolchain: stable
+          args: --release --locked --out dist --compatibility pypi -i python3.12
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -97,7 +98,9 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           command: sdist
-          args: --out dist
+          maturin-version: v1.11.5
+          rust-toolchain: stable
+          args: --locked --out dist
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
