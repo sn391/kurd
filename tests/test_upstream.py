@@ -143,11 +143,11 @@ def test_upstream_tools_list_and_call():
     )
 
     try:
-        wait_for_server("http://localhost:9100", process=upstream)
+        wait_for_server("http://127.0.0.1:9100", process=upstream)
 
         gateway = start_gateway(
             [
-                ("remote", "http://localhost:9100"),
+                ("remote", "http://127.0.0.1:9100"),
             ]
         )
 
@@ -213,13 +213,13 @@ def test_upstream_tools_list_runs_concurrently():
     gateway = None
 
     try:
-        wait_for_server("http://localhost:9100", process=upstream_one)
-        wait_for_server("http://localhost:9101", process=upstream_two)
+        wait_for_server("http://127.0.0.1:9100", process=upstream_one)
+        wait_for_server("http://127.0.0.1:9101", process=upstream_two)
 
         gateway = start_gateway(
             [
-                ("alpha", "http://localhost:9100"),
-                ("beta", "http://localhost:9101"),
+                ("alpha", "http://127.0.0.1:9100"),
+                ("beta", "http://127.0.0.1:9101"),
             ]
         )
 
@@ -270,11 +270,11 @@ def test_upstream_tools_list_uses_cache():
             tool_name="add",
         )
 
-        wait_for_server("http://localhost:9100", process=upstream)
+        wait_for_server("http://127.0.0.1:9100", process=upstream)
 
         gateway = start_gateway(
             [
-                ("remote", "http://localhost:9100"),
+                ("remote", "http://127.0.0.1:9100"),
             ]
         )
 
@@ -298,7 +298,7 @@ def test_upstream_tools_list_uses_cache():
         assert "remote.add" in first_names
 
         counter_after_first = post_json(
-            "http://localhost:9100",
+            "http://127.0.0.1:9100",
             {
                 "jsonrpc": "2.0",
                 "id": 21,
@@ -327,7 +327,7 @@ def test_upstream_tools_list_uses_cache():
         assert "remote.add" in second_names
 
         counter_after_second = post_json(
-            "http://localhost:9100",
+            "http://127.0.0.1:9100",
             {
                 "jsonrpc": "2.0",
                 "id": 23,
@@ -352,14 +352,14 @@ def test_router_unmount_removes_upstream():
             tool_name="add",
         )
 
-        wait_for_server("http://localhost:9100", process=upstream)
+        wait_for_server("http://127.0.0.1:9100", process=upstream)
 
         gateway_code = """
 from kurd import Router
 from kurd._kurd import start_http_gateway
 
 router = Router()
-router.mount("remote", "http://localhost:9100")
+router.mount("remote", "http://127.0.0.1:9100")
 removed = router.unmount("remote")
 assert removed is True
 
@@ -409,14 +409,14 @@ def test_router_refresh_tools_invalidates_cache():
             tool_name="add",
         )
 
-        wait_for_server("http://localhost:9100", process=upstream)
+        wait_for_server("http://127.0.0.1:9100", process=upstream)
 
         gateway_code = """
 from kurd import Router
 from kurd._kurd import start_http_gateway
 
 router = Router()
-router.mount("remote", "http://localhost:9100")
+router.mount("remote", "http://127.0.0.1:9100")
 
 import threading
 import time
@@ -447,7 +447,7 @@ start_http_gateway("127.0.0.1:9200")
         )
 
         counter_after_first = post_json(
-            "http://localhost:9100",
+            "http://127.0.0.1:9100",
             {
                 "jsonrpc": "2.0",
                 "id": 41,
@@ -471,7 +471,7 @@ start_http_gateway("127.0.0.1:9200")
         )
 
         counter_after_refresh = post_json(
-            "http://localhost:9100",
+            "http://127.0.0.1:9100",
             {
                 "jsonrpc": "2.0",
                 "id": 43,
@@ -497,11 +497,11 @@ def test_status_reports_tools_cache_metrics():
             tool_name="add",
         )
 
-        wait_for_server("http://localhost:9100", process=upstream)
+        wait_for_server("http://127.0.0.1:9100", process=upstream)
 
         gateway = start_gateway(
             [
-                ("remote", "http://localhost:9100"),
+                ("remote", "http://127.0.0.1:9100"),
             ]
         )
 
@@ -1261,8 +1261,8 @@ from kurd._kurd import register_upstream, set_allow_private_upstreams
 set_allow_private_upstreams(False)
 
 for name, url in [
-    ("loopback", "http://localhost:9100"),
-    ("localhost", "http://localhost:9100"),
+    ("loopback", "http://127.0.0.1:9100"),
+    ("localhost", "http://127.0.0.1:9100"),
     ("private", "http://10.0.0.1:9100"),
 ]:
     try:
@@ -1273,7 +1273,7 @@ for name, url in [
         raise AssertionError(f"private upstream unexpectedly allowed: {url}")
 
 set_allow_private_upstreams(True)
-register_upstream("allowed", "http://localhost:9100")
+register_upstream("allowed", "http://127.0.0.1:9100")
 """
 
         process = subprocess.Popen(

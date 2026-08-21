@@ -320,7 +320,7 @@ def test_load_upstream_tool():
             tool_name="add",
             call_delay=0.005,
         )
-        wait_for_server("http://localhost:9100", process=upstream)
+        wait_for_server("http://127.0.0.1:9100", process=upstream)
 
         gateway = start_upstream_gateway()
         wait_for_server(KURD_URL)
