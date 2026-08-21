@@ -57,37 +57,41 @@ def post_json(
         return error.code, parsed, elapsed_ms
 
 
-def wait_for_server(url: str, timeout: float = 5.0, process: subprocess.Popen | None = None) -> None:
+def wait_for_server(
+    url: str,
+    timeout: float = 10.0,
+    process: subprocess.Popen | None = None,
+) -> None:
+    import socket
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port
+
+    if port is None:
+        port = 443 if parsed.scheme == "https" else 80
+
     deadline = time.perf_counter() + timeout
 
     while time.perf_counter() < deadline:
         if process and process.poll() is not None:
             stdout, stderr = process.communicate()
-            raise RuntimeError(f"Server process exited prematurely.\nStdout: {stdout}\nStderr: {stderr}")
+            raise RuntimeError(
+                "Server process exited prematurely."
+                f"\nStdout: {stdout}"
+                f"\nStderr: {stderr}"
+            )
 
         try:
-            request = urllib.request.Request(
-                url,
-                data=b"{}",
-                headers={"content-type": "application/json"},
-                method="POST",
-            )
-            urllib.request.urlopen(request, timeout=0.5)
-            return
-        except Exception:
+            with socket.create_connection((host, port), timeout=0.5):
+                return
+        except OSError:
             time.sleep(0.05)
 
-    error_msg = f"Server did not start: {url}"
-    if process and process.poll() is not None:
-        stdout, stderr = process.communicate()
-        error_msg += (
-            f"\nServer process exited."
-            f"\nStdout: {stdout}"
-            f"\nStderr: {stderr}"
-        )
-
-    raise RuntimeError(error_msg)
-
+    raise RuntimeError(
+        f"Server did not start listening on {host}:{port}"
+    )
 
 def terminate_process(process: subprocess.Popen | None) -> None:
     if process is None or process.poll() is not None:
