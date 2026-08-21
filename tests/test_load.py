@@ -78,16 +78,14 @@ def wait_for_server(url: str, timeout: float = 5.0, process: subprocess.Popen | 
             time.sleep(0.05)
 
     error_msg = f"Server did not start: {url}"
-    if process:
-        try:
-            if process.poll() is None:
-                stdout, stderr = process.communicate(timeout=1)
-                error_msg += f"\nServer still running but not responding.\nStdout: {stdout}\nStderr: {stderr}"
-            else:
-                stdout, stderr = process.communicate()
-                error_msg += f"\nServer process exited.\nStdout: {stdout}\nStderr: {stderr}"
-        except:
-            pass
+    if process and process.poll() is not None:
+        stdout, stderr = process.communicate()
+        error_msg += (
+            f"\nServer process exited."
+            f"\nStdout: {stdout}"
+            f"\nStderr: {stderr}"
+        )
+
     raise RuntimeError(error_msg)
 
 
@@ -159,7 +157,7 @@ router.configure_runtime(
     upstream_concurrency=128,
     python_concurrency=128,
 )
-router.mount("remote", "http://localhost:9100")
+router.mount("remote", "http://127.0.0.1:9100")
 
 start_http_gateway("127.0.0.1:9200")
 """
