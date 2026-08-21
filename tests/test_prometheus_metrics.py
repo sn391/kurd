@@ -211,7 +211,7 @@ def test_prometheus_metrics_with_upstream():
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
-            wait_for_server("http://127.0.0.1:9100/mcp", timeout=15)
+            wait_for_server("http://localhost:9100/mcp", timeout=15)
         except RuntimeError as e:
             print(f"Upstream server failed to start: {e}")
             print("Skipping upstream test (upstream_server may have issues)")
@@ -230,7 +230,7 @@ from kurd import Router
 from kurd._kurd import start_http_gateway
 
 router = Router()
-router.mount("remote", "http://127.0.0.1:9100")
+router.mount("remote", "http://localhost:9100")
 
 start_http_gateway("127.0.0.1:9200")
 """

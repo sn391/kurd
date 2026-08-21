@@ -106,6 +106,9 @@ def start_upstream(
             "--call-delay",
             str(call_delay),
         ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
     )
 
 
@@ -141,7 +144,7 @@ router.configure_runtime(
     upstream_concurrency=128,
     python_concurrency=128,
 )
-router.mount("remote", "http://127.0.0.1:9100")
+router.mount("remote", "http://localhost:9100")
 
 start_http_gateway("127.0.0.1:9200")
 """
@@ -302,7 +305,7 @@ def test_load_upstream_tool():
             tool_name="add",
             call_delay=0.005,
         )
-        wait_for_server("http://127.0.0.1:9100")
+        wait_for_server("http://localhost:9100")
 
         gateway = start_upstream_gateway()
         wait_for_server(KURD_URL)

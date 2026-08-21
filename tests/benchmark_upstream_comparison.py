@@ -433,7 +433,7 @@ def test_upstream_tools_with_connection_pooling():
             tool_name="add",
             call_delay=0.010,  # 10ms simulated latency
         )
-        wait_for_server("http://127.0.0.1:9100")
+        wait_for_server("http://localhost:9100")
         print("[OK] Upstream server on :9100 (10ms latency per call)")
 
         # Start Kurd with upstream mount
@@ -448,7 +448,7 @@ router.configure_runtime(
     upstream_concurrency=128,
     python_concurrency=128,
 )
-router.mount("remote", "http://127.0.0.1:9100")
+router.mount("remote", "http://localhost:9100")
 
 start_http_gateway("127.0.0.1:9200")
 """
@@ -468,7 +468,7 @@ import uvicorn
 import json
 
 gateway = PurePythonGatewayWithPooling(port=9202)
-gateway.mount_upstream("remote", "http://127.0.0.1:9100")
+gateway.mount_upstream("remote", "http://localhost:9100")
 
 app = FastAPI()
 
@@ -606,7 +606,7 @@ def test_cache_efficiency_on_tool_discovery():
             tool_name="add",
             call_delay=0.0,
         )
-        wait_for_server("http://127.0.0.1:9100")
+        wait_for_server("http://localhost:9100")
         print("[OK] Upstream server on :9100")
 
         print("\n[2/2] Starting Kurd with upstream mount...")
@@ -615,7 +615,7 @@ from kurd import Router
 from kurd._kurd import start_http_gateway
 
 router = Router()
-router.mount("remote", "http://127.0.0.1:9100")
+router.mount("remote", "http://localhost:9100")
 
 start_http_gateway("127.0.0.1:9200")
 """
