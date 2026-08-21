@@ -12,9 +12,16 @@ from kurd._kurd import (
     clear_tools_cache,
     set_runtime_limits,
     set_request_logging,
+    set_rate_limiting,
     runtime_status,
     init_python_async_runtime,
 )
+from kurd.dead_letter_queue import DeadLetterQueue
+from kurd.idempotency import IdempotencyManager
+from kurd.secrets_management import SecretsManager
+from kurd.webhooks import WebhookManager
+from kurd.distributed_tracing import TracingContext, extract_context, inject_context
+from kurd.distributed_state import DistributedStateManager
 
 
 def _python_type_to_schema(annotation):
@@ -62,6 +69,12 @@ class Router:
     def __init__(self):
         self._tools: Dict[str, Callable[..., Coroutine[Any, Any, Any]]] = {}
         init_python_async_runtime()
+        self.dlq: DeadLetterQueue = None
+        self.idempotency: IdempotencyManager = None
+        self.secrets: SecretsManager = None
+        self.webhooks: WebhookManager = None
+        self.distributed_state: DistributedStateManager = None
+        self.current_trace: TracingContext = None
 
     def mount(self, name: str, url: str) -> None:
         if not name:
@@ -81,6 +94,50 @@ class Router:
     def refresh_tools(self) -> None:
         clear_tools_cache()
 
+    def reload_tool(self, name: str, func: Callable) -> None:
+        """Hot-reload a tool without restarting the gateway."""
+        signature = inspect.signature(func)
+
+        properties = {}
+        required = []
+
+        for param_name, param in signature.parameters.items():
+            annotation = param.annotation
+
+            properties[param_name] = _python_type_to_schema(annotation)
+            if param.default is not inspect.Parameter.empty:
+                properties[param_name]["default"] = param.default
+
+            if param.default is inspect.Parameter.empty:
+                required.append(param_name)
+
+        input_schema = {
+            "type": "object",
+            "properties": properties,
+            "required": required,
+        }
+
+        # Update tool in registry
+        self._tools[name] = func
+        register_tool(
+            name,
+            func.__doc__ or "",
+            json.dumps(input_schema),
+            func,
+        )
+
+        # Clear cache so new schema is used
+        self.refresh_tools()
+
+    def unregister_tool(self, name: str) -> bool:
+        """Remove a tool from the gateway."""
+        if name in self._tools:
+            del self._tools[name]
+            # Note: Rust-side unregistration not exposed yet
+            # Tools stay in Rust registry but dispatch will fail
+            return True
+        return False
+
     def configure_runtime(
         self,
         *,
@@ -88,14 +145,96 @@ class Router:
         upstream_concurrency: int = 64,
         python_concurrency: int = 64,
         request_logging: bool = False,
+        rate_limiting_enabled: bool = False,
+        rate_limit_per_ip_rps: int = 1000,
+        rate_limit_global_rps: int = 10000,
+        enable_dlq: bool = False,
+        enable_idempotency: bool = False,
+        secrets_backend: str = "env",
+        dlq_storage_path: str = "/var/lib/kurd/dlq",
+        idempotency_storage_path: str = "/var/lib/kurd/idempotency",
+        enable_webhooks: bool = False,
+        enable_distributed_state: bool = False,
+        distributed_state_backend: str = "memory",
+        redis_url: str = "redis://localhost:6379/0",
+        enable_distributed_tracing: bool = False,
     ) -> None:
-        """Configure production backpressure and request logging."""
+        """Configure runtime with all production features."""
         set_runtime_limits(
             global_concurrency,
             upstream_concurrency,
             python_concurrency,
         )
         set_request_logging(request_logging)
+        set_rate_limiting(
+            rate_limiting_enabled,
+            rate_limit_per_ip_rps,
+            rate_limit_global_rps,
+        )
+
+        if enable_dlq:
+            self.dlq = DeadLetterQueue(storage_path=dlq_storage_path)
+
+        if enable_idempotency:
+            self.idempotency = IdempotencyManager(storage_path=idempotency_storage_path)
+
+        if secrets_backend != "env":
+            self.secrets = SecretsManager(backend=secrets_backend)
+        else:
+            self.secrets = SecretsManager(backend="env")
+
+        if enable_webhooks:
+            self.webhooks = WebhookManager()
+
+        if enable_distributed_state:
+            self.distributed_state = DistributedStateManager(
+                backend=distributed_state_backend,
+                redis_url=redis_url if distributed_state_backend == "redis" else None,
+            )
+
+        if enable_distributed_tracing:
+            self.current_trace = TracingContext()
+
+    def get_dlq(self) -> DeadLetterQueue:
+        """Get DLQ manager instance."""
+        if not self.dlq:
+            self.dlq = DeadLetterQueue()
+        return self.dlq
+
+    def get_idempotency(self) -> IdempotencyManager:
+        """Get idempotency manager instance."""
+        if not self.idempotency:
+            self.idempotency = IdempotencyManager()
+        return self.idempotency
+
+    def get_secrets(self) -> SecretsManager:
+        """Get secrets manager instance."""
+        if not self.secrets:
+            self.secrets = SecretsManager(backend="env")
+        return self.secrets
+
+    def get_webhooks(self) -> WebhookManager:
+        """Get webhooks manager instance."""
+        if not self.webhooks:
+            self.webhooks = WebhookManager()
+        return self.webhooks
+
+    def get_distributed_state(self) -> DistributedStateManager:
+        """Get distributed state manager instance."""
+        if not self.distributed_state:
+            self.distributed_state = DistributedStateManager(backend="memory")
+        return self.distributed_state
+
+    def get_tracing_context(self) -> TracingContext:
+        """Get current tracing context."""
+        if not self.current_trace:
+            self.current_trace = TracingContext()
+        return self.current_trace
+
+    def set_tracing_context(self, headers: Dict[str, str]) -> TracingContext:
+        """Extract and set tracing context from request headers."""
+        self.current_trace = extract_context(headers)
+        return self.current_trace
 
     def runtime_status(self) -> dict:
         """Return a lightweight snapshot of runtime/backpressure counters."""
@@ -112,7 +251,7 @@ class Router:
             request_logging_enabled,
         ) = runtime_status()
 
-        return {
+        status = {
             "globalConcurrencyLimit": global_limit,
             "upstreamConcurrencyLimit": upstream_limit,
             "pythonConcurrencyLimit": python_limit,
@@ -124,6 +263,29 @@ class Router:
             "pythonRejectedCalls": python_rejections,
             "requestLoggingEnabled": request_logging_enabled,
         }
+
+        if self.dlq:
+            status["dlq"] = self.dlq.to_json()
+
+        if self.idempotency:
+            status["idempotency"] = self.idempotency.to_json()
+
+        if self.secrets:
+            status["secrets"] = self.secrets.to_json()
+
+        if self.webhooks:
+            status["webhooks"] = self.webhooks.to_json()
+
+        if self.distributed_state:
+            status["distributed_state"] = self.distributed_state.to_json()
+
+        if self.current_trace:
+            status["current_trace"] = {
+                "trace_id": self.current_trace.trace_id,
+                "span_count": len(self.current_trace.spans),
+            }
+
+        return status
 
     def tool(self, name: str = None):
         """Decorator to register asynchronous tools."""

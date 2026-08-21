@@ -82,7 +82,16 @@ static UPSTREAM_PEAK_CALLS: Lazy<Mutex<HashMap<String, u64>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static UPSTREAM_REJECTIONS: AtomicU64 = AtomicU64::new(0);
 
+// Rate limiting
+static RATE_LIMIT_ENABLED: AtomicBool = AtomicBool::new(false);
+static RATE_LIMIT_PER_IP_RPS: AtomicU64 = AtomicU64::new(1000);
+static RATE_LIMIT_GLOBAL_RPS: AtomicU64 = AtomicU64::new(10000);
+
+static RATE_LIMIT_REQUESTS: Lazy<Mutex<HashMap<String, Vec<u64>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
 const OVERLOAD_ERROR_CODE: i64 = -32029;
+const RATE_LIMIT_ERROR_CODE: i64 = -32028;
 
 struct AtomicPermit {
     counter: &'static AtomicU64,
@@ -174,6 +183,41 @@ fn try_acquire_upstream(name: &str) -> Option<UpstreamPermit> {
     Some(UpstreamPermit {
         name: name.to_string(),
     })
+}
+
+fn check_rate_limit(client_ip: &str) -> bool {
+    if !RATE_LIMIT_ENABLED.load(Ordering::Relaxed) {
+        return true;
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+
+    let window_start = now.saturating_sub(1000);
+
+    if let Ok(mut requests) = RATE_LIMIT_REQUESTS.lock() {
+        let entry = requests.entry(client_ip.to_string()).or_insert_with(Vec::new);
+
+        entry.retain(|&timestamp| timestamp > window_start);
+
+        let per_ip_limit = RATE_LIMIT_PER_IP_RPS.load(Ordering::Relaxed);
+        if entry.len() >= per_ip_limit as usize {
+            return false;
+        }
+
+        entry.push(now);
+
+        let global_limit = RATE_LIMIT_GLOBAL_RPS.load(Ordering::Relaxed);
+        let total_requests: usize = requests.values().map(|v| v.len()).sum();
+
+        if total_requests > global_limit as usize {
+            return false;
+        }
+    }
+
+    true
 }
 
 fn request_trace_id(headers: &HeaderMap) -> String {
@@ -941,6 +985,14 @@ fn set_request_logging(enabled: bool) -> PyResult<()> {
 }
 
 #[pyfunction]
+fn set_rate_limiting(enabled: bool, per_ip_rps: u64, global_rps: u64) -> PyResult<()> {
+    RATE_LIMIT_ENABLED.store(enabled, Ordering::Release);
+    RATE_LIMIT_PER_IP_RPS.store(per_ip_rps, Ordering::Release);
+    RATE_LIMIT_GLOBAL_RPS.store(global_rps, Ordering::Release);
+    Ok(())
+}
+
+#[pyfunction]
 fn runtime_status() -> PyResult<(u64, u64, u64, u64, u64, u64, u64, u64, u64, bool)> {
     Ok((
         GLOBAL_CONCURRENCY_LIMIT.load(Ordering::Acquire),
@@ -1188,6 +1240,7 @@ fn build_http_router() -> AxumRouter {
     AxumRouter::new()
         .route("/health", get(health))
         .route("/status", get(status))
+        .route("/metrics", get(metrics_prometheus))
         .route("/mcp", post(mcp_root))
         .layer(DefaultBodyLimit::max(MAX_MCP_BODY_BYTES))
 }
@@ -1422,14 +1475,232 @@ fn _kurd(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(security_status, m)?)?;
     m.add_function(wrap_pyfunction!(set_runtime_limits, m)?)?;
     m.add_function(wrap_pyfunction!(set_request_logging, m)?)?;
+    m.add_function(wrap_pyfunction!(set_rate_limiting, m)?)?;
     m.add_function(wrap_pyfunction!(runtime_status, m)?)?;
-    
+
     Ok(())
 }
 
 
 async fn health() -> &'static str {
     "Kurd MCP Gateway"
+}
+
+async fn metrics_prometheus() -> impl IntoResponse {
+    let mut output = String::new();
+
+    // Help text
+    output.push_str("# HELP kurd_requests_total Total HTTP requests received\n");
+    output.push_str("# TYPE kurd_requests_total counter\n");
+
+    // Runtime metrics
+    let total_requests = TOTAL_HTTP_REQUESTS.load(Ordering::Acquire);
+    let completed_requests = COMPLETED_HTTP_REQUESTS.load(Ordering::Acquire);
+    let rejected_requests = REJECTED_HTTP_REQUESTS.load(Ordering::Acquire);
+    let active_requests = GLOBAL_ACTIVE_REQUESTS.load(Ordering::Acquire);
+    let peak_active_requests = GLOBAL_PEAK_ACTIVE_REQUESTS.load(Ordering::Acquire);
+
+    output.push_str(&format!("kurd_requests_total {{status=\"total\"}} {}\n", total_requests));
+    output.push_str(&format!("kurd_requests_total {{status=\"completed\"}} {}\n", completed_requests));
+    output.push_str(&format!("kurd_requests_total {{status=\"rejected\"}} {}\n", rejected_requests));
+
+    output.push_str("# HELP kurd_requests_active Active HTTP requests\n");
+    output.push_str("# TYPE kurd_requests_active gauge\n");
+    output.push_str(&format!("kurd_requests_active {}\n", active_requests));
+
+    output.push_str("# HELP kurd_requests_peak_active Peak active HTTP requests\n");
+    output.push_str("# TYPE kurd_requests_peak_active gauge\n");
+    output.push_str(&format!("kurd_requests_peak_active {}\n", peak_active_requests));
+
+    // Latency metrics
+    let total_latency_ms = TOTAL_HTTP_LATENCY_MS.load(Ordering::Acquire);
+    let avg_latency_ms = if completed_requests > 0 {
+        total_latency_ms as f64 / completed_requests as f64
+    } else {
+        0.0
+    };
+
+    output.push_str("# HELP kurd_request_latency_ms Average request latency in milliseconds\n");
+    output.push_str("# TYPE kurd_request_latency_ms gauge\n");
+    output.push_str(&format!("kurd_request_latency_ms {:.2}\n", avg_latency_ms));
+
+    // Python callback metrics
+    let python_active = PYTHON_ACTIVE_CALLS.load(Ordering::Acquire);
+    let python_peak = PYTHON_PEAK_ACTIVE_CALLS.load(Ordering::Acquire);
+    let python_rejections = PYTHON_REJECTIONS.load(Ordering::Acquire);
+
+    output.push_str("# HELP kurd_python_active_calls Active Python tool calls\n");
+    output.push_str("# TYPE kurd_python_active_calls gauge\n");
+    output.push_str(&format!("kurd_python_active_calls {}\n", python_active));
+
+    output.push_str("# HELP kurd_python_peak_active_calls Peak active Python tool calls\n");
+    output.push_str("# TYPE kurd_python_peak_active_calls gauge\n");
+    output.push_str(&format!("kurd_python_peak_active_calls {}\n", python_peak));
+
+    output.push_str("# HELP kurd_python_rejections_total Python tool call rejections\n");
+    output.push_str("# TYPE kurd_python_rejections_total counter\n");
+    output.push_str(&format!("kurd_python_rejections_total {}\n", python_rejections));
+
+    // Concurrency limits
+    output.push_str("# HELP kurd_concurrency_limit Concurrency limits\n");
+    output.push_str("# TYPE kurd_concurrency_limit gauge\n");
+    let global_limit = GLOBAL_CONCURRENCY_LIMIT.load(Ordering::Acquire);
+    let upstream_limit = UPSTREAM_CONCURRENCY_LIMIT.load(Ordering::Acquire);
+    let python_limit = PYTHON_CONCURRENCY_LIMIT.load(Ordering::Acquire);
+
+    output.push_str(&format!("kurd_concurrency_limit {{type=\"global\"}} {}\n", global_limit));
+    output.push_str(&format!("kurd_concurrency_limit {{type=\"upstream\"}} {}\n", upstream_limit));
+    output.push_str(&format!("kurd_concurrency_limit {{type=\"python\"}} {}\n", python_limit));
+
+    // Upstream metrics
+    let upstreams = UPSTREAM_REGISTRY
+        .read()
+        .map(|registry| registry.clone())
+        .unwrap_or_default();
+
+    let metrics = UPSTREAM_METRICS
+        .read()
+        .map(|registry| registry.clone())
+        .unwrap_or_default();
+
+    let breakers = CIRCUIT_BREAKERS
+        .read()
+        .map(|registry| registry.clone())
+        .unwrap_or_default();
+
+    if !upstreams.is_empty() {
+        output.push_str("# HELP kurd_upstream_requests_total Upstream MCP server requests\n");
+        output.push_str("# TYPE kurd_upstream_requests_total counter\n");
+
+        for (name, _url) in &upstreams {
+            let metric = metrics.get(name).cloned().unwrap_or_default();
+            output.push_str(&format!("kurd_upstream_requests_total {{upstream=\"{}\"}} {}\n", name, metric.requests));
+        }
+
+        output.push_str("# HELP kurd_upstream_successes_total Successful upstream calls\n");
+        output.push_str("# TYPE kurd_upstream_successes_total counter\n");
+
+        for (name, _url) in &upstreams {
+            let metric = metrics.get(name).cloned().unwrap_or_default();
+            output.push_str(&format!("kurd_upstream_successes_total {{upstream=\"{}\"}} {}\n", name, metric.successes));
+        }
+
+        output.push_str("# HELP kurd_upstream_failures_total Failed upstream calls\n");
+        output.push_str("# TYPE kurd_upstream_failures_total counter\n");
+
+        for (name, _url) in &upstreams {
+            let metric = metrics.get(name).cloned().unwrap_or_default();
+            output.push_str(&format!("kurd_upstream_failures_total {{upstream=\"{}\"}} {}\n", name, metric.failures));
+        }
+
+        output.push_str("# HELP kurd_upstream_retries_total Upstream call retries\n");
+        output.push_str("# TYPE kurd_upstream_retries_total counter\n");
+
+        for (name, _url) in &upstreams {
+            let metric = metrics.get(name).cloned().unwrap_or_default();
+            output.push_str(&format!("kurd_upstream_retries_total {{upstream=\"{}\"}} {}\n", name, metric.retries));
+        }
+
+        output.push_str("# HELP kurd_upstream_latency_ms Average upstream call latency\n");
+        output.push_str("# TYPE kurd_upstream_latency_ms gauge\n");
+
+        for (name, _url) in &upstreams {
+            let metric = metrics.get(name).cloned().unwrap_or_default();
+            let avg_latency = if metric.successes + metric.failures > 0 {
+                metric.total_latency_ms as f64 / (metric.successes + metric.failures) as f64
+            } else {
+                0.0
+            };
+            output.push_str(&format!("kurd_upstream_latency_ms {{upstream=\"{}\"}} {:.2}\n", name, avg_latency));
+        }
+
+        output.push_str("# HELP kurd_upstream_circuit_breaker_state Circuit breaker state (0=closed, 1=open)\n");
+        output.push_str("# TYPE kurd_upstream_circuit_breaker_state gauge\n");
+
+        for (name, _url) in &upstreams {
+            let breaker = breakers.get(name).copied().unwrap_or(CircuitState {
+                failures: 0,
+                opened_at: None,
+            });
+            let state = match breaker.opened_at {
+                Some(opened_at) if opened_at.elapsed() < CIRCUIT_RESET_TIMEOUT => 1,
+                _ => 0,
+            };
+            output.push_str(&format!("kurd_upstream_circuit_breaker_state {{upstream=\"{}\"}} {}\n", name, state));
+        }
+    }
+
+    // Cache metrics
+    let cache_metrics = TOOLS_CACHE_METRICS
+        .read()
+        .map(|metrics| *metrics)
+        .unwrap_or_default();
+
+    output.push_str("# HELP kurd_cache_hits_total Tool cache hits\n");
+    output.push_str("# TYPE kurd_cache_hits_total counter\n");
+    output.push_str(&format!("kurd_cache_hits_total {}\n", cache_metrics.hits));
+
+    output.push_str("# HELP kurd_cache_misses_total Tool cache misses\n");
+    output.push_str("# TYPE kurd_cache_misses_total counter\n");
+    output.push_str(&format!("kurd_cache_misses_total {}\n", cache_metrics.misses));
+
+    output.push_str("# HELP kurd_cache_invalidations_total Tool cache invalidations\n");
+    output.push_str("# TYPE kurd_cache_invalidations_total counter\n");
+    output.push_str(&format!("kurd_cache_invalidations_total {}\n", cache_metrics.invalidations));
+
+    // Upstream rejections
+    let upstream_rejections = UPSTREAM_REJECTIONS.load(Ordering::Acquire);
+    output.push_str("# HELP kurd_upstream_rejections_total Upstream call rejections due to concurrency limits\n");
+    output.push_str("# TYPE kurd_upstream_rejections_total counter\n");
+    output.push_str(&format!("kurd_upstream_rejections_total {}\n", upstream_rejections));
+
+    // Upstream concurrency
+    let upstream_active = UPSTREAM_ACTIVE_CALLS
+        .lock()
+        .map(|active| active.clone())
+        .unwrap_or_default();
+
+    let upstream_peaks = UPSTREAM_PEAK_CALLS
+        .lock()
+        .map(|peaks| peaks.clone())
+        .unwrap_or_default();
+
+    if !upstream_active.is_empty() {
+        output.push_str("# HELP kurd_upstream_active_calls Active upstream calls\n");
+        output.push_str("# TYPE kurd_upstream_active_calls gauge\n");
+
+        for name in UPSTREAM_REGISTRY
+            .read()
+            .map(|registry| registry.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default()
+        {
+            let active = upstream_active.get(&name).copied().unwrap_or(0);
+            output.push_str(&format!("kurd_upstream_active_calls {{upstream=\"{}\"}} {}\n", name, active));
+        }
+    }
+
+    if !upstream_peaks.is_empty() {
+        output.push_str("# HELP kurd_upstream_peak_active_calls Peak active upstream calls\n");
+        output.push_str("# TYPE kurd_upstream_peak_active_calls gauge\n");
+
+        for name in UPSTREAM_REGISTRY
+            .read()
+            .map(|registry| registry.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default()
+        {
+            let peak = upstream_peaks.get(&name).copied().unwrap_or(0);
+            output.push_str(&format!("kurd_upstream_peak_active_calls {{upstream=\"{}\"}} {}\n", name, peak));
+        }
+    }
+
+    // Response with Prometheus content type
+    (
+        [(
+            "content-type",
+            HeaderValue::from_static("text/plain; version=0.0.4"),
+        )],
+        output,
+    )
 }
 
 async fn status() -> impl IntoResponse {

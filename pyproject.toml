@@ -4,8 +4,8 @@ build-backend = "maturin"
 
 [project]
 name = "kurd"
-version = "0.3.0"
-description = "High-performance Model Context Protocol gateway for Python powered by Rust."
+version = "0.4.0"
+description = "Enterprise Model Context Protocol gateway with multi-tenancy, billing, RBAC, DLQ, idempotency, and secrets management."
 authors = [
     { name = "Semko Kermashani", email = "sn391@yahoo.com" }
 ]

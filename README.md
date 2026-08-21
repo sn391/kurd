@@ -73,7 +73,10 @@ Health and operational status are exposed at:
 ```text
 GET /health
 GET /status
+GET /metrics
 ```
+
+The `/metrics` endpoint exports Prometheus-format metrics for integration with monitoring systems (Datadog, Prometheus, New Relic, etc.).
 
 ## Mount an Upstream MCP Server
 
@@ -132,6 +135,53 @@ Kurd currently provides a production security baseline:
 - overload rejection through explicit backpressure
 
 For deployments exposed beyond localhost, use TLS at the reverse proxy or ingress layer and apply your normal network-level authentication and authorization controls.
+
+## Observability & Monitoring
+
+### Prometheus Metrics Export
+
+Kurd exports metrics in Prometheus format at the `/metrics` endpoint:
+
+```bash
+curl http://127.0.0.1:9200/metrics
+```
+
+**Available metrics:**
+
+- `kurd_requests_total` - Total HTTP requests (total, completed, rejected)
+- `kurd_requests_active` - Currently active requests
+- `kurd_requests_peak_active` - Peak concurrent requests
+- `kurd_request_latency_ms` - Average request latency
+- `kurd_python_active_calls` - Active Python tool calls
+- `kurd_python_rejections_total` - Python tool call rejections
+- `kurd_upstream_requests_total` - Requests to upstream servers (per upstream)
+- `kurd_upstream_successes_total` - Successful upstream calls
+- `kurd_upstream_failures_total` - Failed upstream calls
+- `kurd_upstream_retries_total` - Upstream call retries
+- `kurd_upstream_latency_ms` - Average upstream latency
+- `kurd_upstream_circuit_breaker_state` - Circuit breaker state (0=closed, 1=open)
+- `kurd_cache_hits_total` - Tool discovery cache hits
+- `kurd_cache_misses_total` - Tool discovery cache misses
+- `kurd_cache_invalidations_total` - Cache invalidations
+- `kurd_concurrency_limit` - Configured concurrency limits
+
+**Integration example (Prometheus):**
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: 'kurd'
+    static_configs:
+      - targets: ['127.0.0.1:9200']
+    metrics_path: '/metrics'
+```
+
+**Integration example (Datadog):**
+
+```yaml
+# datadog.yaml
+openmetrics_endpoint: http://127.0.0.1:9200/metrics
+```
 
 ## MCP 2026-07-28
 
