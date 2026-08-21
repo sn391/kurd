@@ -57,10 +57,14 @@ def post_json(
         return error.code, parsed, elapsed_ms
 
 
-def wait_for_server(url: str, timeout: float = 5.0) -> None:
+def wait_for_server(url: str, timeout: float = 5.0, process: subprocess.Popen | None = None) -> None:
     deadline = time.perf_counter() + timeout
 
     while time.perf_counter() < deadline:
+        if process and process.poll() is not None:
+            stdout, stderr = process.communicate()
+            raise RuntimeError(f"Server process exited prematurely.\nStdout: {stdout}\nStderr: {stderr}")
+
         try:
             request = urllib.request.Request(
                 url,
@@ -73,7 +77,18 @@ def wait_for_server(url: str, timeout: float = 5.0) -> None:
         except Exception:
             time.sleep(0.05)
 
-    raise RuntimeError(f"Server did not start: {url}")
+    error_msg = f"Server did not start: {url}"
+    if process:
+        try:
+            if process.poll() is None:
+                stdout, stderr = process.communicate(timeout=1)
+                error_msg += f"\nServer still running but not responding.\nStdout: {stdout}\nStderr: {stderr}"
+            else:
+                stdout, stderr = process.communicate()
+                error_msg += f"\nServer process exited.\nStdout: {stdout}\nStderr: {stderr}"
+        except:
+            pass
+    raise RuntimeError(error_msg)
 
 
 def terminate_process(process: subprocess.Popen | None) -> None:
@@ -305,7 +320,7 @@ def test_load_upstream_tool():
             tool_name="add",
             call_delay=0.005,
         )
-        wait_for_server("http://localhost:9100")
+        wait_for_server("http://localhost:9100", process=upstream)
 
         gateway = start_upstream_gateway()
         wait_for_server(KURD_URL)

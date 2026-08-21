@@ -48,11 +48,15 @@ def get_json(url: str) -> dict:
         return json.loads(response.read())
 
 
-def wait_for_server(url: str, timeout: float = 5.0):
+def wait_for_server(url: str, timeout: float = 5.0, process: subprocess.Popen | None = None):
     import platform
     started = time.perf_counter()
 
     while time.perf_counter() - started < timeout:
+        if process and process.poll() is not None:
+            stdout, stderr = process.communicate()
+            raise RuntimeError(f"Server process exited prematurely.\nStdout: {stdout}\nStderr: {stderr}")
+
         try:
             request = urllib.request.Request(
                 url,
@@ -68,8 +72,13 @@ def wait_for_server(url: str, timeout: float = 5.0):
             time.sleep(0.05)
 
     error_msg = f"Server did not start: {url}"
-    if platform.system() == "Darwin":
-        error_msg += " (macOS: try using localhost instead of 127.0.0.1)"
+    if process:
+        if process.poll() is None:
+            stdout, stderr = process.communicate(timeout=1)
+            error_msg += f"\nServer still running but not responding.\nStdout: {stdout}\nStderr: {stderr}"
+        else:
+            stdout, stderr = process.communicate()
+            error_msg += f"\nServer process exited.\nStdout: {stdout}\nStderr: {stderr}"
     raise RuntimeError(error_msg)
 
 
@@ -134,7 +143,7 @@ def test_upstream_tools_list_and_call():
     )
 
     try:
-        wait_for_server("http://localhost:9100")
+        wait_for_server("http://localhost:9100", process=upstream)
 
         gateway = start_gateway(
             [
@@ -204,8 +213,8 @@ def test_upstream_tools_list_runs_concurrently():
     gateway = None
 
     try:
-        wait_for_server("http://localhost:9100")
-        wait_for_server("http://localhost:9101")
+        wait_for_server("http://localhost:9100", process=upstream_one)
+        wait_for_server("http://localhost:9101", process=upstream_two)
 
         gateway = start_gateway(
             [
@@ -261,7 +270,7 @@ def test_upstream_tools_list_uses_cache():
             tool_name="add",
         )
 
-        wait_for_server("http://localhost:9100")
+        wait_for_server("http://localhost:9100", process=upstream)
 
         gateway = start_gateway(
             [
@@ -343,7 +352,7 @@ def test_router_unmount_removes_upstream():
             tool_name="add",
         )
 
-        wait_for_server("http://localhost:9100")
+        wait_for_server("http://localhost:9100", process=upstream)
 
         gateway_code = """
 from kurd import Router
@@ -400,7 +409,7 @@ def test_router_refresh_tools_invalidates_cache():
             tool_name="add",
         )
 
-        wait_for_server("http://localhost:9100")
+        wait_for_server("http://localhost:9100", process=upstream)
 
         gateway_code = """
 from kurd import Router
@@ -488,7 +497,7 @@ def test_status_reports_tools_cache_metrics():
             tool_name="add",
         )
 
-        wait_for_server("http://localhost:9100")
+        wait_for_server("http://localhost:9100", process=upstream)
 
         gateway = start_gateway(
             [
