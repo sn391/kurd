@@ -220,7 +220,7 @@ class AuthorizationManager:
     def set_tool_blacklist(self, tenant_id: str, tools: Set[str]) -> None:
         """Set blacklist of tools tenant cannot access."""
         if tenant_id not in self.tenant_acls:
-            self.tenant_acls[tenant_id] = TenantAcL(tenant_id=tenant_id)
+            self.tenant_acls[tenant_id] = TenantAcl(tenant_id=tenant_id)
 
         self.tenant_acls[tenant_id].tool_blacklist = tools
 

@@ -7,6 +7,7 @@ from typing import Callable, Dict, Any, Coroutine
 from kurd._kurd import (
     fast_parse,
     register_tool,
+    unregister_tool as _rust_unregister_tool,
     register_upstream,
     unregister_upstream,
     clear_tools_cache,
@@ -130,13 +131,12 @@ class Router:
         self.refresh_tools()
 
     def unregister_tool(self, name: str) -> bool:
-        """Remove a tool from the gateway."""
-        if name in self._tools:
-            del self._tools[name]
-            # Note: Rust-side unregistration not exposed yet
-            # Tools stay in Rust registry but dispatch will fail
-            return True
-        return False
+        """Remove a tool from the gateway (Python dict and Rust registry)."""
+        if name not in self._tools:
+            return False
+        del self._tools[name]
+        _rust_unregister_tool(name)
+        return True
 
     def configure_runtime(
         self,
@@ -151,8 +151,8 @@ class Router:
         enable_dlq: bool = False,
         enable_idempotency: bool = False,
         secrets_backend: str = "env",
-        dlq_storage_path: str = "/var/lib/kurd/dlq",
-        idempotency_storage_path: str = "/var/lib/kurd/idempotency",
+        dlq_storage_path: str = None,
+        idempotency_storage_path: str = None,
         enable_webhooks: bool = False,
         enable_distributed_state: bool = False,
         distributed_state_backend: str = "memory",

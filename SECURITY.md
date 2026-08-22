@@ -8,9 +8,9 @@ Security fixes are provided for the latest minor release line.
 
 | Version | Supported |
 |---|---|
-| 0.3.x | Yes |
-| 0.2.x | No |
-| < 0.2 | No |
+| 0.4.x | Yes |
+| 0.3.x | No |
+| < 0.3 | No |
 
 ## Reporting a Vulnerability
 

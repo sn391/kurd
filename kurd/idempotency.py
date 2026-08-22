@@ -50,7 +50,7 @@ class IdempotencyManager:
 
     def __init__(
         self,
-        storage_path: str = "/var/lib/kurd/idempotency",
+        storage_path: str = None,
         result_ttl_hours: int = 24,
     ):
         """
@@ -60,6 +60,9 @@ class IdempotencyManager:
             storage_path: Directory to store idempotency data
             result_ttl_hours: How long to keep results
         """
+        if storage_path is None:
+            import tempfile, os
+            storage_path = os.path.join(tempfile.gettempdir(), "kurd", "idempotency")
         self.storage_path = Path(storage_path)
         self.storage_path.mkdir(parents=True, exist_ok=True)
         self.db_path = self.storage_path / "idempotency.db"

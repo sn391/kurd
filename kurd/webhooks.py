@@ -66,7 +66,7 @@ class WebhookManager:
 
     def __init__(
         self,
-        storage_path: str = "/var/lib/kurd/webhooks",
+        storage_path: str = None,
         max_retries: int = 5,
         retry_delay_seconds: int = 60,
     ):
@@ -78,6 +78,9 @@ class WebhookManager:
             max_retries: Max delivery attempts
             retry_delay_seconds: Initial retry delay
         """
+        if storage_path is None:
+            import tempfile, os
+            storage_path = os.path.join(tempfile.gettempdir(), "kurd", "webhooks")
         self.storage_path = Path(storage_path)
         self.storage_path.mkdir(parents=True, exist_ok=True)
         self.db_path = self.storage_path / "webhooks.db"

@@ -1180,6 +1180,26 @@ def _kurd_loop_runner():
 }
 
 #[pyfunction]
+fn unregister_tool(name: String) -> PyResult<bool> {
+    let mut tools = TOOL_REGISTRY
+        .write()
+        .map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "Tool registry lock poisoned"
+            )
+        })?;
+
+    let removed = tools.remove(&name).is_some();
+    drop(tools);
+
+    if removed {
+        invalidate_tools_cache();
+    }
+
+    Ok(removed)
+}
+
+#[pyfunction]
 fn register_tool(
     py: Python<'_>,
     name: String,
@@ -1464,6 +1484,7 @@ fn _kurd(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(stop_http_gateway, m)?)?;
     m.add_function(wrap_pyfunction!(http_gateway_status, m)?)?;
     m.add_function(wrap_pyfunction!(register_tool, m)?)?;
+    m.add_function(wrap_pyfunction!(unregister_tool, m)?)?;
     m.add_function(wrap_pyfunction!(init_python_async_runtime, m)?)?;
     m.add_function(wrap_pyfunction!(register_upstream, m)?)?;
     m.add_function(wrap_pyfunction!(unregister_upstream, m)?)?;
@@ -1958,8 +1979,10 @@ fn execute_python_tool(
 
             // This is intentionally executed from Tokio's blocking pool.
             // Waiting for the Python future must never block an Axum/Tokio
-            // async worker thread.
-            let result = future.call_method0("result")?;
+            // async worker thread. A timeout prevents a hung coroutine from
+            // exhausting the blocking pool indefinitely.
+            let timeout_secs = UPSTREAM_TIMEOUT_MS.load(Ordering::Relaxed) as f64 / 1000.0;
+            let result = future.call_method1("result", (timeout_secs,))?;
 
             Ok(result.unbind())
         })?

@@ -46,7 +46,7 @@ class MessageStatus(Enum):
 class DeadLetterQueue:
     """Manages dead letter queue for failed requests."""
 
-    def __init__(self, storage_path: str = "/var/lib/kurd/dlq", max_retries: int = 5):
+    def __init__(self, storage_path: str = None, max_retries: int = 5):
         """
         Initialize DLQ.
 
@@ -54,6 +54,9 @@ class DeadLetterQueue:
             storage_path: Directory to store DLQ messages
             max_retries: Maximum retry attempts
         """
+        if storage_path is None:
+            import tempfile, os
+            storage_path = os.path.join(tempfile.gettempdir(), "kurd", "dlq")
         self.storage_path = Path(storage_path)
         self.storage_path.mkdir(parents=True, exist_ok=True)
         self.max_retries = max_retries

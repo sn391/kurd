@@ -28,13 +28,16 @@ from typing import Dict, Optional, Any, List
 class PersistenceManager:
     """Manages persistent storage of Kurd configuration and state."""
 
-    def __init__(self, db_path: str = "/var/lib/kurd/config.db"):
+    def __init__(self, db_path: str = None):
         """
         Initialize persistence manager.
 
         Args:
             db_path: Path to SQLite database file
         """
+        if db_path is None:
+            import tempfile, os
+            db_path = os.path.join(tempfile.gettempdir(), "kurd", "config.db")
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
