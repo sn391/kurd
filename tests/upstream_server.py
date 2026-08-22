@@ -2,6 +2,17 @@ import argparse
 import json
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from socketserver import TCPServer
+
+class FastThreadingHTTPServer(ThreadingHTTPServer):
+    """Threading HTTP server that avoids hostname/FQDN lookup during bind."""
+
+    def server_bind(self):
+        TCPServer.server_bind(self)
+        host, port = self.server_address
+        self.server_name = host
+        self.server_port = port
+
 
 
 def build_handler(tool_name: str, delay: float, call_delay: float = 0.0):
@@ -127,8 +138,8 @@ if __name__ == "__main__":
         args.call_delay,
     )
     try:
-        server = ThreadingHTTPServer(("localhost", args.port), handler)
-        print(f"Server started on http://localhost:{args.port}", flush=True)
+        server = FastThreadingHTTPServer(("127.0.0.1", args.port), handler)
+        print(f"Server started on http://127.0.0.1:{args.port}", flush=True)
         server.serve_forever()
     except OSError as e:
         print(f"Failed to start server on port {args.port}: {e}", flush=True)
