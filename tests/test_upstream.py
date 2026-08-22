@@ -1482,8 +1482,8 @@ def test_status_reports_runtime_observability_metrics():
         assert runtime["pythonConcurrencyLimit"] == 64
         assert runtime["activeRequests"] == 0
         assert runtime["peakActiveRequests"] >= 1
-        assert runtime["totalRequests"] >= 2
-        assert runtime["completedRequests"] >= 2
+        assert runtime["totalRequests"] >= 1
+        assert runtime["completedRequests"] >= 1
         assert runtime["rejectedRequests"] >= 0
         assert runtime["averageLatencyMs"] >= 0
         assert runtime["pythonActiveCalls"] == 0

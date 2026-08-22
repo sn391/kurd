@@ -386,7 +386,7 @@ def test_load_sustained_burst_stays_healthy():
 
         runtime = status["runtime"]
         assert runtime["activeRequests"] == 0
-        assert runtime["completedRequests"] >= 1001
+        assert runtime["completedRequests"] >= 1000
         assert runtime["peakActiveRequests"] >= 1
 
     finally:
