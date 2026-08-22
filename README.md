@@ -2,17 +2,19 @@
 
 A high-performance Model Context Protocol (MCP) gateway for Python, powered by Rust.
 
-Kurd combines a Python-first developer API with a Rust data plane for MCP routing, upstream aggregation, concurrency control, security, caching, and observability.
+Kurd combines a Python-first developer API with a Rust data plane for MCP routing, upstream aggregation, concurrency control, security, caching, and observability. The optional enterprise layer adds multi-tenancy, billing, idempotency, a dead-letter queue, secrets management, webhooks, distributed state, and distributed tracing.
 
 ## Status
 
 Kurd is in **beta** and is being hardened for production use.
 
-Current release line: **0.3.x**
+Current release line: **0.4.x**
 
 The gateway targets the MCP **2026-07-28** protocol revision while preserving compatibility paths used by existing Kurd applications.
 
 ## Highlights
+
+### Core gateway
 
 - Python-first `Router` API
 - Rust core using Tokio, Axum, Serde, and Reqwest
@@ -32,7 +34,19 @@ The gateway targets the MCP **2026-07-28** protocol revision while preserving co
 - Global, per-upstream, and Python callback backpressure
 - Request IDs and structured request logging
 - Runtime, cache, and upstream metrics
+- Prometheus metrics export
 - Cross-platform CI and automated PyPI release workflow
+
+### Enterprise layer
+
+- Multi-tenancy with per-tenant API keys, quotas, and tool ACLs
+- Billing and usage tracking with configurable pricing models
+- Request idempotency (SQLite-backed, 24-hour result TTL)
+- Dead-letter queue with exponential-backoff replay
+- Secrets management (Kubernetes, HashiCorp Vault, AWS Secrets Manager, env)
+- Webhook notifications for gateway events
+- Distributed state (Redis or in-memory)
+- W3C-compatible distributed tracing context propagation
 
 ## Installation
 
@@ -123,16 +137,17 @@ The HTTP `/status` endpoint also reports runtime, cache, security, upstream late
 
 ## Security
 
-Kurd currently provides a production security baseline:
+Kurd provides a production security baseline:
 
-- maximum MCP request body size
+- maximum MCP request body size (1 MiB)
 - JSON content-type validation
-- optional bearer-token authentication
-- upstream URL validation
+- optional bearer-token authentication with constant-time comparison
+- upstream URL validation (scheme, credentials, fragment)
 - configurable private/loopback upstream policy
 - configurable upstream request timeout
 - sanitized upstream transport errors
 - overload rejection through explicit backpressure
+- per-IP and global rate limiting
 
 For deployments exposed beyond localhost, use TLS at the reverse proxy or ingress layer and apply your normal network-level authentication and authorization controls.
 
@@ -200,6 +215,187 @@ Kurd implements the stateless 2026 MCP model used for routable gateway traffic:
 
 Kurd rejects mismatched modern MCP headers and unsupported protocol versions.
 
+## Enterprise Features
+
+### Multi-Tenancy
+
+Isolate tools, quotas, and API keys per tenant:
+
+```python
+from kurd.multitenancy import TenantManager
+
+manager = TenantManager()
+api_key = manager.add_tenant(
+    tenant_id="acme-corp",
+    name="Acme Corp",
+    quota_rps=100,
+    allowed_tools=["add", "multiply"],
+)
+```
+
+Each tenant gets a unique API key. The manager enforces per-tenant RPS quotas and tool access control lists independently.
+
+### Billing & Usage Tracking
+
+Track tool usage per tenant with configurable pricing:
+
+```python
+from kurd.billing import BillingManager
+
+billing = BillingManager()
+billing.set_pricing({
+    "add": {"per_call": 0.001, "per_latency_ms": 0.0001},
+})
+
+billing.track_call(
+    tenant_id="acme-corp",
+    tool_name="add",
+    latency_ms=25.5,
+    success=True,
+)
+
+report = billing.get_usage_report("acme-corp", period="2026-08")
+```
+
+Supported billing models: per-request, per-latency, tiered, and hybrid.
+
+### Request Idempotency
+
+Prevent duplicate tool executions using idempotency keys:
+
+```python
+router.configure_runtime(enable_idempotency=True)
+idempotency = router.get_idempotency()
+
+is_duplicate, cached = idempotency.check_idempotent_key(
+    idempotency_key="req-abc-123",
+    tenant_id="acme-corp",
+)
+if is_duplicate:
+    return cached
+
+result = process_request()
+idempotency.store_result("req-abc-123", "acme-corp", result)
+```
+
+Results are stored in SQLite with a 24-hour TTL by default.
+
+### Dead-Letter Queue
+
+Capture failed requests for later replay:
+
+```python
+router.configure_runtime(enable_dlq=True, dlq_storage_path="/data/kurd/dlq")
+dlq = router.get_dlq()
+
+dlq.add_message(
+    request_id="req-123",
+    tenant_id="acme-corp",
+    tool_name="add",
+    arguments={"a": 1, "b": 2},
+    error="Timeout after 30s",
+)
+
+dlq.register_replay_handler("add", add_handler)
+success, error = dlq.replay_message("dlq_abc123")
+
+pending = dlq.get_pending_replays()
+stats = dlq.get_statistics(tenant_id="acme-corp")
+```
+
+Replay uses exponential backoff (up to 1 hour) and a configurable maximum retry count. Archived messages are cleaned up via `cleanup_archived(days=30)`.
+
+### Secrets Management
+
+Retrieve secrets from Kubernetes, HashiCorp Vault, AWS Secrets Manager, or environment variables:
+
+```python
+from kurd.secrets_management import SecretsManager
+
+# Kubernetes (in-cluster)
+manager = SecretsManager(backend="kubernetes")
+
+# HashiCorp Vault
+manager = SecretsManager(
+    backend="vault",
+    vault_addr="https://vault.example.com",
+    vault_token="s.xxxxx",
+)
+
+# AWS Secrets Manager
+manager = SecretsManager(backend="aws", aws_region="us-east-1")
+
+# Environment variables (default)
+manager = SecretsManager(backend="env")
+
+secret = manager.get_secret("db_password")
+```
+
+Secrets are cached locally until `clear_cache()` is called. Required third-party packages (`kubernetes`, `hvac`, `boto3`) are only imported when the corresponding backend is activated.
+
+### Webhooks
+
+Receive event-driven notifications for gateway events:
+
+```python
+router.configure_runtime(enable_webhooks=True)
+webhooks = router.get_webhooks()
+
+webhooks.register_webhook(
+    url="https://example.com/hooks",
+    events=["error", "dlq_replay_failed", "rate_limit_exceeded"],
+    tenant_id="acme-corp",
+)
+
+webhooks.trigger_event(
+    event_type="error",
+    tenant_id="acme-corp",
+    data={"tool": "add", "error": "timeout"},
+)
+```
+
+Supported events: `error`, `dlq_message_added`, `dlq_replay_success`, `dlq_replay_failed`, `rate_limit_exceeded`, `health_check_failed`, `request_timeout`, `authorization_failed`, `idempotent_duplicate`.
+
+Deliveries are signed with HMAC-SHA256 and stored for audit via `get_deliveries()`.
+
+### Distributed State
+
+Share state across multiple Kurd instances using Redis or in-memory storage:
+
+```python
+router.configure_runtime(
+    enable_distributed_state=True,
+    distributed_state_backend="redis",
+    redis_url="redis://localhost:6379/0",
+)
+state = router.get_distributed_state()
+
+state.set("gateway:config:version", 42)
+version = state.get("gateway:config:version")
+
+state.increment("counters:acme-corp:calls")
+state.append_to_list("events:acme-corp", {"type": "tool_call"})
+```
+
+Use the `memory` backend for local development or single-instance deployments.
+
+### Distributed Tracing
+
+Propagate W3C Trace Context across services:
+
+```python
+from kurd.distributed_tracing import extract_context, inject_context
+
+trace = extract_context(incoming_headers)
+span = trace.create_span("tool_execution", {"tool": "add"})
+span.set_attribute("result", 42)
+span.end()
+
+upstream_headers = inject_context(trace)
+```
+
+Tracing context is accessible from `router.get_tracing_context()` and is included in `runtime_status()` output when enabled.
+
 ## Performance
 
 The repository includes end-to-end HTTP load tests in `tests/test_load.py`.
@@ -213,7 +409,7 @@ Example measurements from a Windows development machine:
 | Local Python tool | 100 | 556.0 req/s | 18.27 ms | 29.52 ms | 32.43 ms | 0% |
 | Upstream tool | 10 | 412.2 req/s | 21.77 ms | 36.35 ms | 42.74 ms | 0% |
 | Upstream tool | 50 | 229.8 req/s | 20.61 ms | 534.61 ms | 549.25 ms | 0% |
-| Upstream tool | 100 | 293.6 req/s | 30.12 ms | 531.40 ms | 535.34 ms | 0% |
+| Upstream tool | 100 | 293.6 req/s | 30.12 ms | 531.40 ms | 535.40 ms | 0% |
 | Local sustained burst | 100 | 573.3 req/s | 73.51 ms | 179.13 ms | 218.49 ms | 0% |
 
 These are local measurements, not universal performance guarantees. Hardware, operating system, Python version, payload shape, upstream implementation, and network conditions affect results.
@@ -258,6 +454,12 @@ Python application
        |
        v
    Kurd Router
+   (Python API layer)
+       |
+       +-- Enterprise modules (optional)
+       |   multitenancy, billing, idempotency,
+       |   DLQ, secrets, webhooks,
+       |   distributed state, tracing
        |
        v
    PyO3 boundary
@@ -270,7 +472,7 @@ Python application
    +-------------> Upstream MCP servers
 ```
 
-Rust owns the HTTP server, MCP validation, routing, caching, retries, circuit breaking, backpressure, and operational metrics. Python provides the developer-facing registration and configuration API.
+Rust owns the HTTP server, MCP validation, routing, caching, retries, circuit breaking, backpressure, rate limiting, and operational metrics. Python provides the developer-facing registration, configuration, and enterprise-feature APIs.
 
 ## Testing
 
@@ -292,6 +494,7 @@ The current suite covers:
 - global and Python callback backpressure
 - request ID propagation
 - runtime observability
+- Prometheus metrics export
 - load and burst behavior
 
 ## Compatibility
@@ -314,12 +517,34 @@ Kurd uses semantic versioning while the public API stabilizes.
 kurd/
 ├── kurd/
 │   ├── __init__.py
-│   └── router.py
+│   ├── router.py
+│   ├── multitenancy.py
+│   ├── billing.py
+│   ├── idempotency.py
+│   ├── dead_letter_queue.py
+│   ├── secrets_management.py
+│   ├── webhooks.py
+│   ├── distributed_state.py
+│   ├── distributed_tracing.py
+│   ├── api_key_management.py
+│   ├── audit_logging.py
+│   ├── authorization.py
+│   ├── error_recovery.py
+│   ├── graceful_shutdown.py
+│   ├── health_checks.py
+│   ├── persistence.py
+│   ├── request_response_logging.py
+│   ├── request_validation.py
+│   ├── resource_limits.py
+│   ├── telemetry.py
+│   └── tls_management.py
 ├── src/
 │   └── lib.rs
 ├── tests/
+│   ├── test_core.py
 │   ├── test_upstream.py
 │   ├── test_load.py
+│   ├── test_prometheus_metrics.py
 │   └── upstream_server.py
 ├── Cargo.toml
 ├── pyproject.toml

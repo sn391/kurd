@@ -1,5 +1,5 @@
 
-from ._kurd import fast_parse, fast_parse_batch, start_tcp_gateway
+from ._kurd import fast_parse, fast_parse_batch
 from .router import Router
 
-__all__ = ["fast_parse", "fast_parse_batch", "start_tcp_gateway", "Router"]
+__all__ = ["fast_parse", "fast_parse_batch", "Router"]

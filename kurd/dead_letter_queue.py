@@ -334,9 +334,11 @@ class DeadLetterQueue:
         with sqlite3.connect(self.db_path) as conn:
             if tenant_id:
                 where = "WHERE tenant_id = ?"
+                status_kw = "AND"
                 params = (tenant_id,)
             else:
                 where = ""
+                status_kw = "WHERE"
                 params = ()
 
             cursor = conn.execute(
@@ -346,19 +348,19 @@ class DeadLetterQueue:
             total = cursor.fetchone()[0]
 
             cursor = conn.execute(
-                f"SELECT COUNT(*) FROM dlq_messages {where} AND status = ?",
+                f"SELECT COUNT(*) FROM dlq_messages {where} {status_kw} status = ?",
                 (*params, MessageStatus.PENDING.value),
             )
             pending = cursor.fetchone()[0]
 
             cursor = conn.execute(
-                f"SELECT COUNT(*) FROM dlq_messages {where} AND status = ?",
+                f"SELECT COUNT(*) FROM dlq_messages {where} {status_kw} status = ?",
                 (*params, MessageStatus.SUCCESSFUL.value),
             )
             successful = cursor.fetchone()[0]
 
             cursor = conn.execute(
-                f"SELECT COUNT(*) FROM dlq_messages {where} AND status = ?",
+                f"SELECT COUNT(*) FROM dlq_messages {where} {status_kw} status = ?",
                 (*params, MessageStatus.FAILED.value),
             )
             failed = cursor.fetchone()[0]
