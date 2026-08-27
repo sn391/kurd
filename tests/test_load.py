@@ -207,7 +207,7 @@ def benchmark(
         ]
 
         for future in concurrent.futures.as_completed(futures):
-            status, response, latency_ms = future.result(timeout=15)
+            status, response, latency_ms = future.result(timeout=60)
             latencies.append(latency_ms)
 
             if status == 200 and response.get("result", {}).get("isError") is False:

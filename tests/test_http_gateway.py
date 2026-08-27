@@ -126,9 +126,9 @@ def test_missing_content_type_returns_415():
         headers={"Content-Type": "text/plain"},
         method="POST",
     )
-    with urllib.request.urlopen(req) as resp:
-        result = json.loads(resp.read())
-    assert result["error"]["code"] == -32600
+    with pytest.raises(urllib.error.HTTPError) as exc_info:
+        urllib.request.urlopen(req)
+    assert exc_info.value.code == 415
 
 
 def test_bearer_auth_rejects_without_token():
