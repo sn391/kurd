@@ -17,8 +17,14 @@ Usage:
 """
 
 from typing import Optional, Any, Dict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
+
+try:
+    from importlib.metadata import version as _pkg_version
+    _KURD_VERSION = _pkg_version("kurd")
+except Exception:
+    _KURD_VERSION = "unknown"
 
 
 @dataclass
@@ -26,7 +32,7 @@ class OTELConfig:
     """OpenTelemetry configuration."""
 
     service_name: str
-    service_version: str = "0.4.0"
+    service_version: str = field(default_factory=lambda: _KURD_VERSION)
     exporter: str = "otlp"  # otlp, jaeger, datadog, newrelic
     endpoint: Optional[str] = None
     api_key: Optional[str] = None
@@ -92,7 +98,7 @@ class OTELTracer:
 
 def setup_otel(
     service_name: str,
-    service_version: str = "0.4.0",
+    service_version: str = _KURD_VERSION,
     exporter: str = "otlp",
     endpoint: Optional[str] = None,
     api_key: Optional[str] = None,

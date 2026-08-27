@@ -163,8 +163,8 @@ class HealthCheckManager:
 
         # Check recent activity (fail if no requests in 5 minutes)
         if (datetime.utcnow() - self.last_check_time).total_seconds() > 300:
-            # Update last check time
             self.last_check_time = datetime.utcnow()
+            all_healthy = False
             checks["activity"] = {
                 "status": "degraded",
                 "message": "No activity in 5 minutes",
@@ -177,7 +177,7 @@ class HealthCheckManager:
                 "latency_ms": 0,
             }
 
-        status = "healthy" if all_healthy else "healthy"  # Liveness is more lenient
+        status = "healthy" if all_healthy else "unhealthy"
 
         return HealthStatus(
             status=status,

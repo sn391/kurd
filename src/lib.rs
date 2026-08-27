@@ -1,8 +1,9 @@
 use pyo3::prelude::*;
+use rayon::prelude::*;
 use serde_json::Value;
-use tokio::net::TcpListener;
 use std::time::{Duration, Instant};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
+use axum::extract::ConnectInfo;
 use rand::Rng;
 use std::collections::HashMap;
 use axum::{
@@ -13,7 +14,6 @@ use axum::{
     routing::{get, post},
     Router as AxumRouter,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::oneshot;
 use once_cell::sync::Lazy;
 use std::sync::{Mutex, RwLock};
@@ -89,6 +89,65 @@ static RATE_LIMIT_GLOBAL_RPS: AtomicU64 = AtomicU64::new(10000);
 
 static RATE_LIMIT_REQUESTS: Lazy<Mutex<HashMap<String, Vec<u64>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+
+static RATE_LIMIT_LAST_CLEANUP_MS: AtomicU64 = AtomicU64::new(0);
+
+// Latency histogram buckets (ms). +Inf is the implicit last slot.
+const LATENCY_BUCKETS: [u64; 11] = [1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000];
+
+static LATENCY_HISTOGRAM: Lazy<Vec<AtomicU64>> =
+    Lazy::new(|| (0..=LATENCY_BUCKETS.len()).map(|_| AtomicU64::new(0)).collect());
+
+fn record_latency(latency_ms: u64) {
+    let bucket = LATENCY_BUCKETS
+        .iter()
+        .position(|&b| latency_ms <= b)
+        .unwrap_or(LATENCY_BUCKETS.len());
+    LATENCY_HISTOGRAM[bucket].fetch_add(1, Ordering::Relaxed);
+}
+
+static IP_ALLOWLIST: Lazy<RwLock<Option<std::collections::HashSet<IpAddr>>>> =
+    Lazy::new(|| RwLock::new(None));
+
+fn check_ip_allowlist(client_ip: &str) -> bool {
+    let list = match IP_ALLOWLIST.read() {
+        Ok(g) => g,
+        Err(_) => return true,
+    };
+
+    let Some(ref allowed) = *list else {
+        return true;
+    };
+
+    client_ip.parse::<IpAddr>().map_or(false, |ip| allowed.contains(&ip))
+}
+
+#[pyfunction]
+fn set_ip_allowlist(ips: Vec<String>) -> PyResult<()> {
+    let parsed: std::collections::HashSet<IpAddr> = ips
+        .iter()
+        .filter_map(|s| s.parse::<IpAddr>().ok())
+        .collect();
+
+    match IP_ALLOWLIST.write() {
+        Ok(mut guard) => {
+            *guard = Some(parsed);
+            Ok(())
+        }
+        Err(_) => Err(pyo3::exceptions::PyRuntimeError::new_err("IP allowlist lock poisoned")),
+    }
+}
+
+#[pyfunction]
+fn clear_ip_allowlist() -> PyResult<()> {
+    match IP_ALLOWLIST.write() {
+        Ok(mut guard) => {
+            *guard = None;
+            Ok(())
+        }
+        Err(_) => Err(pyo3::exceptions::PyRuntimeError::new_err("IP allowlist lock poisoned")),
+    }
+}
 
 const OVERLOAD_ERROR_CODE: i64 = -32029;
 const RATE_LIMIT_ERROR_CODE: i64 = -32028;
@@ -198,6 +257,13 @@ fn check_rate_limit(client_ip: &str) -> bool {
     let window_start = now.saturating_sub(1000);
 
     if let Ok(mut requests) = RATE_LIMIT_REQUESTS.lock() {
+        // Sweep stale IP entries at most once per minute to prevent unbounded memory growth.
+        let last_cleanup = RATE_LIMIT_LAST_CLEANUP_MS.load(Ordering::Relaxed);
+        if now.saturating_sub(last_cleanup) > 60_000 {
+            requests.retain(|_, timestamps| timestamps.iter().any(|&t| t > window_start));
+            RATE_LIMIT_LAST_CLEANUP_MS.store(now, Ordering::Relaxed);
+        }
+
         let entry = requests.entry(client_ip.to_string()).or_insert_with(Vec::new);
 
         entry.retain(|&timestamp| timestamp > window_start);
@@ -245,16 +311,13 @@ fn log_http_request(
         return;
     }
 
-    eprintln!(
-        "{}",
-        serde_json::json!({
-            "event": "kurd.http.request",
-            "requestId": request_id,
-            "method": method,
-            "status": status.as_u16(),
-            "latencyMs": latency_ms,
-            "bodyBytes": body_bytes
-        })
+    tracing::info!(
+        event = "kurd.http.request",
+        request_id = request_id,
+        method = method,
+        status = status.as_u16(),
+        latency_ms = latency_ms,
+        body_bytes = body_bytes,
     );
 }
 
@@ -313,13 +376,18 @@ struct ToolsCacheMetrics {
 static TOOLS_CACHE_METRICS: Lazy<RwLock<ToolsCacheMetrics>> =
     Lazy::new(|| RwLock::new(ToolsCacheMetrics::default()));
 
-const TOOLS_CACHE_TTL: Duration = Duration::from_secs(30);
+static TOOLS_CACHE_TTL_MS: AtomicU64 = AtomicU64::new(30_000);
+
+fn tools_cache_ttl() -> Duration {
+    Duration::from_millis(TOOLS_CACHE_TTL_MS.load(Ordering::Relaxed))
+}
 
 const MCP_PROTOCOL_VERSION: &str = "2026-07-28";
 const MCP_HEADER_MISMATCH: i64 = -32020;
 const MCP_UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
 const MCP_LIST_TTL_MS: u64 = 30_000;
 const MCP_CACHE_SCOPE: &str = "public";
+const TOOLS_LIST_PAGE_SIZE: usize = 100;
 
 
 fn content_type_is_json(headers: &HeaderMap) -> bool {
@@ -565,20 +633,20 @@ fn validate_modern_http_request(
             .and_then(|value| value.to_str().ok());
 
         match (header_name, body_name) {
-            (Some(header_name), Some(body_name)) if header_name == body_name => {}
-            (Some(header_name), Some(body_name)) => {
+            // Names present and matching — OK.
+            (Some(h), Some(b)) if h == b => {}
+            // Names present but mismatched — header error.
+            (Some(h), Some(b)) => {
                 return Err(jsonrpc_error(
                     StatusCode::BAD_REQUEST,
                     request_id.clone(),
                     MCP_HEADER_MISMATCH,
                     "Mcp-Name header does not match tool name",
-                    Some(serde_json::json!({
-                        "header": header_name,
-                        "body": body_name
-                    })),
+                    Some(serde_json::json!({ "header": h, "body": b })),
                 ));
             }
-            _ => {
+            // No header on a modern request — header error.
+            (None, Some(_)) => {
                 return Err(jsonrpc_error(
                     StatusCode::BAD_REQUEST,
                     request_id.clone(),
@@ -587,6 +655,8 @@ fn validate_modern_http_request(
                     None,
                 ));
             }
+            // body_name is None — let param validation below return -32602.
+            _ => {}
         }
     }
 
@@ -597,7 +667,7 @@ fn validate_modern_http_request(
 async fn list_upstream_tools() -> Vec<Value> {
     if let Ok(cache) = TOOLS_CACHE.read() {
         if let Some(cache) = cache.as_ref() {
-            if cache.created_at.elapsed() < TOOLS_CACHE_TTL {
+            if cache.created_at.elapsed() < tools_cache_ttl() {
                 if let Ok(mut metrics) = TOOLS_CACHE_METRICS.write() {
                     metrics.hits += 1;
                 }
@@ -624,11 +694,11 @@ async fn list_upstream_tools() -> Vec<Value> {
 
     for (upstream_name, upstream_url) in upstreams {
         tasks.spawn(async move {
-            let payload = serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": format!("kurd-tools-list-{upstream_name}"),
-                "method": "tools/list",
-                "params": {
+            let mut all_tools: Vec<Value> = Vec::new();
+            let mut cursor: Option<String> = None;
+
+            loop {
+                let mut params = serde_json::json!({
                     "_meta": {
                         "io.modelcontextprotocol/protocolVersion": MCP_PROTOCOL_VERSION,
                         "io.modelcontextprotocol/clientInfo": {
@@ -637,60 +707,81 @@ async fn list_upstream_tools() -> Vec<Value> {
                         },
                         "io.modelcontextprotocol/clientCapabilities": {}
                     }
+                });
+
+                if let Some(ref c) = cursor {
+                    params["cursor"] = Value::String(c.clone());
                 }
-            });
 
-            let timeout = Duration::from_millis(
-                UPSTREAM_TIMEOUT_MS.load(Ordering::Relaxed)
-            );
+                let payload = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": format!("kurd-tools-list-{upstream_name}"),
+                    "method": "tools/list",
+                    "params": params
+                });
 
-            let response = match HTTP_CLIENT
-                .post(&upstream_url)
-                .header("MCP-Protocol-Version", MCP_PROTOCOL_VERSION)
-                .header("Mcp-Method", "tools/list")
-                .timeout(timeout)
-                .json(&payload)
-                .send()
-                .await
-            {
-                Ok(response) if response.status().is_success() => response,
-                _ => return Vec::<Value>::new(),
-            };
+                let timeout = Duration::from_millis(
+                    UPSTREAM_TIMEOUT_MS.load(Ordering::Relaxed)
+                );
 
-            let body: Value = match response.json().await {
-                Ok(value) => value,
-                Err(_) => return Vec::<Value>::new(),
-            };
+                let response = match HTTP_CLIENT
+                    .post(&upstream_url)
+                    .header("MCP-Protocol-Version", MCP_PROTOCOL_VERSION)
+                    .header("Mcp-Method", "tools/list")
+                    .timeout(timeout)
+                    .json(&payload)
+                    .send()
+                    .await
+                {
+                    Ok(r) if r.status().is_success() => r,
+                    _ => break,
+                };
 
-            let Some(tools) = body
-                .get("result")
-                .and_then(|result| result.get("tools"))
-                .and_then(|tools| tools.as_array())
-            else {
-                return Vec::<Value>::new();
-            };
+                let body: Value = match response.json().await {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
 
-            tools
-                .iter()
-                .filter_map(|tool| {
-                    let remote_name = tool
+                let tools = match body
+                    .get("result")
+                    .and_then(|r| r.get("tools"))
+                    .and_then(|t| t.as_array())
+                {
+                    Some(t) => t.clone(),
+                    None => break,
+                };
+
+                for tool in &tools {
+                    let remote_name = match tool
                         .get("name")
-                        .and_then(|value| value.as_str())?;
+                        .and_then(|v| v.as_str())
+                    {
+                        Some(n) => n,
+                        None => continue,
+                    };
 
                     let mut tool = tool.clone();
-
-                    if let Some(object) = tool.as_object_mut() {
-                        object.insert(
+                    if let Some(obj) = tool.as_object_mut() {
+                        obj.insert(
                             "name".to_string(),
-                            Value::String(
-                                format!("{upstream_name}.{remote_name}")
-                            ),
+                            Value::String(format!("{upstream_name}.{remote_name}")),
                         );
                     }
+                    all_tools.push(tool);
+                }
 
-                    Some(tool)
-                })
-                .collect::<Vec<_>>()
+                cursor = body
+                    .get("result")
+                    .and_then(|r| r.get("nextCursor"))
+                    .and_then(|c| c.as_str())
+                    .map(str::to_owned);
+
+                if cursor.is_none() {
+                    break;
+                }
+            }
+
+            all_tools
         });
     }
 
@@ -993,19 +1084,19 @@ fn set_rate_limiting(enabled: bool, per_ip_rps: u64, global_rps: u64) -> PyResul
 }
 
 #[pyfunction]
-fn runtime_status() -> PyResult<(u64, u64, u64, u64, u64, u64, u64, u64, u64, bool)> {
-    Ok((
-        GLOBAL_CONCURRENCY_LIMIT.load(Ordering::Acquire),
-        UPSTREAM_CONCURRENCY_LIMIT.load(Ordering::Acquire),
-        PYTHON_CONCURRENCY_LIMIT.load(Ordering::Acquire),
-        GLOBAL_ACTIVE_REQUESTS.load(Ordering::Acquire),
-        GLOBAL_PEAK_ACTIVE_REQUESTS.load(Ordering::Acquire),
-        TOTAL_HTTP_REQUESTS.load(Ordering::Acquire),
-        COMPLETED_HTTP_REQUESTS.load(Ordering::Acquire),
-        REJECTED_HTTP_REQUESTS.load(Ordering::Acquire),
-        PYTHON_REJECTIONS.load(Ordering::Acquire),
-        REQUEST_LOGGING_ENABLED.load(Ordering::Acquire),
-    ))
+fn runtime_status(py: Python<'_>) -> PyResult<pyo3::Py<pyo3::types::PyDict>> {
+    let dict = pyo3::types::PyDict::new(py);
+    dict.set_item("globalConcurrencyLimit", GLOBAL_CONCURRENCY_LIMIT.load(Ordering::Acquire))?;
+    dict.set_item("upstreamConcurrencyLimit", UPSTREAM_CONCURRENCY_LIMIT.load(Ordering::Acquire))?;
+    dict.set_item("pythonConcurrencyLimit", PYTHON_CONCURRENCY_LIMIT.load(Ordering::Acquire))?;
+    dict.set_item("activeRequests", GLOBAL_ACTIVE_REQUESTS.load(Ordering::Acquire))?;
+    dict.set_item("peakActiveRequests", GLOBAL_PEAK_ACTIVE_REQUESTS.load(Ordering::Acquire))?;
+    dict.set_item("totalRequests", TOTAL_HTTP_REQUESTS.load(Ordering::Acquire))?;
+    dict.set_item("completedRequests", COMPLETED_HTTP_REQUESTS.load(Ordering::Acquire))?;
+    dict.set_item("rejectedRequests", REJECTED_HTTP_REQUESTS.load(Ordering::Acquire))?;
+    dict.set_item("pythonRejectedCalls", PYTHON_REJECTIONS.load(Ordering::Acquire))?;
+    dict.set_item("requestLoggingEnabled", REQUEST_LOGGING_ENABLED.load(Ordering::Acquire))?;
+    Ok(dict.unbind())
 }
 
 #[pyfunction]
@@ -1058,6 +1149,41 @@ fn set_upstream_timeout_ms(timeout_ms: u64) -> PyResult<()> {
 
     UPSTREAM_TIMEOUT_MS.store(timeout_ms, Ordering::Relaxed);
     Ok(())
+}
+
+#[pyfunction]
+fn set_tools_cache_ttl_ms(ttl_ms: u64) -> PyResult<()> {
+    if ttl_ms == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Tools cache TTL must be greater than zero",
+        ));
+    }
+
+    TOOLS_CACHE_TTL_MS.store(ttl_ms, Ordering::Relaxed);
+    invalidate_tools_cache();
+    Ok(())
+}
+
+#[pyfunction]
+fn list_upstreams() -> PyResult<Vec<(String, String)>> {
+    let registry = UPSTREAM_REGISTRY
+        .read()
+        .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err(
+            "Upstream registry lock poisoned"
+        ))?;
+
+    Ok(registry.iter().map(|(n, u)| (n.clone(), u.clone())).collect())
+}
+
+#[pyfunction]
+fn list_tools() -> PyResult<Vec<String>> {
+    let registry = TOOL_REGISTRY
+        .read()
+        .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err(
+            "Tool registry lock poisoned"
+        ))?;
+
+    Ok(registry.keys().cloned().collect())
 }
 
 #[pyfunction]
@@ -1256,12 +1382,26 @@ fn fast_parse(payload: &str) -> PyResult<(Option<String>, Option<String>, Option
     Ok((method, id, params))
 }
 
+async fn mcp_options() -> impl IntoResponse {
+    (
+        StatusCode::NO_CONTENT,
+        [
+            ("access-control-allow-origin", "*"),
+            ("access-control-allow-methods", "POST, OPTIONS"),
+            ("access-control-allow-headers",
+             "content-type, authorization, mcp-protocol-version, mcp-method, mcp-session-id"),
+            ("access-control-max-age", "86400"),
+        ],
+        "",
+    )
+}
+
 fn build_http_router() -> AxumRouter {
     AxumRouter::new()
         .route("/health", get(health))
         .route("/status", get(status))
         .route("/metrics", get(metrics_prometheus))
-        .route("/mcp", post(mcp_root))
+        .route("/mcp", post(mcp_root).options(mcp_options))
         .layer(DefaultBodyLimit::max(MAX_MCP_BODY_BYTES))
 }
 
@@ -1272,7 +1412,7 @@ async fn run_http_server(
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let app = build_http_router();
 
-    axum::serve(listener, app)
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(async move {
             let _ = shutdown_rx.await;
         })
@@ -1296,6 +1436,27 @@ fn start_http_gateway(py: Python<'_>, addr: String) -> PyResult<()> {
     }
 
     py.detach(|| {
+        // Install a default subscriber if the host hasn't set one up yet.
+        // Respects RUST_LOG / KURD_LOG env vars; falls back to info-level.
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_env("KURD_LOG")
+                    .or_else(|_| tracing_subscriber::EnvFilter::try_from_default_env())
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("kurd=info")),
+            )
+            .try_init();
+
+        // Auto-load bearer token from environment if not already configured.
+        if let Ok(token) = std::env::var("KURD_AUTH_TOKEN") {
+            if !token.is_empty() {
+                if let Ok(mut guard) = HTTP_BEARER_TOKEN.write() {
+                    if guard.is_none() {
+                        *guard = Some(token);
+                    }
+                }
+            }
+        }
+
         let runtime = tokio::runtime::Runtime::new()
             .map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(
@@ -1396,90 +1557,25 @@ fn http_gateway_status() -> PyResult<(bool, Option<String>)> {
 fn fast_parse_batch(
     payloads: Vec<String>,
 ) -> PyResult<Vec<(Option<String>, Option<String>, Option<String>)>> {
-    let mut results = Vec::with_capacity(payloads.len());
+    payloads
+        .into_par_iter()
+        .map(|payload| {
+            let parsed: Value = serde_json::from_str(&payload)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
-    for payload in payloads {
-        let parsed: Value = serde_json::from_str(&payload)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+            let method = parsed.get("method").and_then(|v| v.as_str()).map(str::to_owned);
+            let id = parsed.get("id").map(|v| v.to_string());
+            let params = parsed.get("params").map(|v| v.to_string());
 
-        let method = parsed
-            .get("method")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned);
-
-        let id = parsed
-            .get("id")
-            .map(|v| v.to_string());
-
-        let params = parsed
-            .get("params")
-            .map(|v| v.to_string());
-
-        results.push((method, id, params));
-    }
-
-    Ok(results)
-}
-
-/// Starts a high-performance TCP Transport Gateway in Rust (manages thousands of connections concurrently)
-#[pyfunction]
-fn start_tcp_gateway(addr: String, py_callback: Py<PyAny>) -> PyResult<()> {
-    let rt = tokio::runtime::Runtime::new()?;
-    
-    rt.block_on(async move {
-        let listener = TcpListener::bind(&addr).await.unwrap();
-        println!("Rust TCP Transport Gateway running on {}", addr);
-
-        loop {
-            let (mut socket, _) = match listener.accept().await {
-                Ok(val) => val,
-                Err(_) => continue,
-            };
-
-            let _py_cb = Python::attach(|py| py_callback.clone_ref(py));
-
-            tokio::spawn(async move {
-                let mut buf = vec![0; 4096];
-                loop {
-                    let n = match socket.read(&mut buf).await {
-                        Ok(0) => return,
-                        Ok(n) => n,
-                        Err(_) => return,
-                    };
-
-                    let raw_data = String::from_utf8_lossy(&buf[..n]).to_string();
-                    
-                    // Pre-process and validate rapidly in Rust
-                    let parsed_result = match serde_json::from_str::<Value>(&raw_data) {
-                        Ok(v) => {
-                            serde_json::json!({
-                                "status": "success",
-                                "method": v.get("method").and_then(|m| m.as_str()).unwrap_or("unknown"),
-                                "payload": v
-                            }).to_string()
-                        }
-                        Err(_) => {
-                            serde_json::json!({"error": "invalid json"}).to_string()
-                        }
-                    };
-
-                    // Send back to client over TCP socket
-                    if let Err(_) = socket.write_all(parsed_result.as_bytes()).await {
-                        break;
-                    }
-                }
-            });
-        }
-    });
-
-    Ok(())
+            Ok((method, id, params))
+        })
+        .collect()
 }
 
 #[pymodule]
 fn _kurd(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fast_parse, m)?)?;
     m.add_function(wrap_pyfunction!(fast_parse_batch, m)?)?;
-    m.add_function(wrap_pyfunction!(start_tcp_gateway, m)?)?;
     m.add_function(wrap_pyfunction!(start_http_gateway, m)?)?;
     m.add_function(wrap_pyfunction!(stop_http_gateway, m)?)?;
     m.add_function(wrap_pyfunction!(http_gateway_status, m)?)?;
@@ -1493,11 +1589,16 @@ fn _kurd(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(clear_http_bearer_token, m)?)?;
     m.add_function(wrap_pyfunction!(set_allow_private_upstreams, m)?)?;
     m.add_function(wrap_pyfunction!(set_upstream_timeout_ms, m)?)?;
+    m.add_function(wrap_pyfunction!(set_tools_cache_ttl_ms, m)?)?;
+    m.add_function(wrap_pyfunction!(list_upstreams, m)?)?;
+    m.add_function(wrap_pyfunction!(list_tools, m)?)?;
     m.add_function(wrap_pyfunction!(security_status, m)?)?;
     m.add_function(wrap_pyfunction!(set_runtime_limits, m)?)?;
     m.add_function(wrap_pyfunction!(set_request_logging, m)?)?;
     m.add_function(wrap_pyfunction!(set_rate_limiting, m)?)?;
     m.add_function(wrap_pyfunction!(runtime_status, m)?)?;
+    m.add_function(wrap_pyfunction!(set_ip_allowlist, m)?)?;
+    m.add_function(wrap_pyfunction!(clear_ip_allowlist, m)?)?;
 
     Ok(())
 }
@@ -1714,6 +1815,32 @@ async fn metrics_prometheus() -> impl IntoResponse {
         }
     }
 
+    // Latency histogram
+    output.push_str("# HELP kurd_request_latency_histogram_ms Request latency histogram in milliseconds\n");
+    output.push_str("# TYPE kurd_request_latency_histogram_ms histogram\n");
+    let mut cumulative: u64 = 0;
+    for (i, &bucket_ms) in LATENCY_BUCKETS.iter().enumerate() {
+        cumulative += LATENCY_HISTOGRAM[i].load(Ordering::Acquire);
+        output.push_str(&format!(
+            "kurd_request_latency_histogram_ms_bucket {{le=\"{}\"}} {}\n",
+            bucket_ms, cumulative
+        ));
+    }
+    let inf_count = LATENCY_HISTOGRAM[LATENCY_BUCKETS.len()].load(Ordering::Acquire);
+    cumulative += inf_count;
+    output.push_str(&format!(
+        "kurd_request_latency_histogram_ms_bucket {{le=\"+Inf\"}} {}\n",
+        cumulative
+    ));
+    output.push_str(&format!(
+        "kurd_request_latency_histogram_ms_count {}\n",
+        completed_requests
+    ));
+    output.push_str(&format!(
+        "kurd_request_latency_histogram_ms_sum {}\n",
+        total_latency_ms
+    ));
+
     // Response with Prometheus content type
     (
         [(
@@ -1788,9 +1915,9 @@ async fn status() -> impl IntoResponse {
         .and_then(|cache| {
             cache.as_ref().map(|entry| {
                 serde_json::json!({
-                    "cached": entry.created_at.elapsed() < TOOLS_CACHE_TTL,
+                    "cached": entry.created_at.elapsed() < tools_cache_ttl(),
                     "ageMs": entry.created_at.elapsed().as_millis(),
-                    "ttlMs": TOOLS_CACHE_TTL.as_millis(),
+                    "ttlMs": tools_cache_ttl().as_millis(),
                     "toolCount": entry.tools.len(),
                     "hits": cache_metrics.hits,
                     "misses": cache_metrics.misses,
@@ -1802,7 +1929,7 @@ async fn status() -> impl IntoResponse {
             serde_json::json!({
                 "cached": false,
                 "ageMs": 0,
-                "ttlMs": TOOLS_CACHE_TTL.as_millis(),
+                "ttlMs": tools_cache_ttl().as_millis(),
                 "toolCount": 0,
                 "hits": cache_metrics.hits,
                 "misses": cache_metrics.misses,
@@ -2002,20 +2129,83 @@ fn execute_python_tool(
     })
 }
 
-async fn mcp_root(headers: HeaderMap, body: Bytes) -> Response {
+async fn mcp_root(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     let started_at = Instant::now();
     let request_id = request_trace_id(&headers);
     let body_bytes = body.len();
-    let method = serde_json::from_slice::<Value>(&body)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("method")
-                .and_then(|method| method.as_str())
-                .map(str::to_owned)
-        });
+    let pre_parsed = serde_json::from_slice::<Value>(&body).ok();
+    let method = pre_parsed.as_ref().and_then(|value| {
+        value
+            .get("method")
+            .and_then(|method| method.as_str())
+            .map(str::to_owned)
+    });
 
     TOTAL_HTTP_REQUESTS.fetch_add(1, Ordering::Relaxed);
+
+    let client_ip: String = headers
+        .get("x-real-ip")
+        .or_else(|| headers.get("x-forwarded-for"))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| addr.ip().to_string());
+
+    if !check_ip_allowlist(&client_ip) {
+        REJECTED_HTTP_REQUESTS.fetch_add(1, Ordering::Relaxed);
+        let mut response = jsonrpc_error(
+            StatusCode::FORBIDDEN,
+            Value::Null,
+            -32003,
+            "IP not in allowlist",
+            None,
+        )
+        .into_response();
+
+        if let Ok(value) = HeaderValue::from_str(&request_id) {
+            response.headers_mut().insert("x-request-id", value);
+        }
+
+        log_http_request(
+            &request_id,
+            method.as_deref(),
+            response.status(),
+            started_at.elapsed().as_millis() as u64,
+            body_bytes,
+        );
+        return response;
+    }
+
+    if !check_rate_limit(&client_ip) {
+        REJECTED_HTTP_REQUESTS.fetch_add(1, Ordering::Relaxed);
+        let mut response = jsonrpc_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            Value::Null,
+            RATE_LIMIT_ERROR_CODE,
+            "Rate limit exceeded",
+            Some(serde_json::json!({ "retryAfterMs": 1000 })),
+        )
+        .into_response();
+
+        response.headers_mut().insert("retry-after", HeaderValue::from_static("1"));
+
+        if let Ok(value) = HeaderValue::from_str(&request_id) {
+            response.headers_mut().insert("x-request-id", value);
+        }
+
+        log_http_request(
+            &request_id,
+            method.as_deref(),
+            response.status(),
+            started_at.elapsed().as_millis() as u64,
+            body_bytes,
+        );
+        return response;
+    }
 
     let global_limit = GLOBAL_CONCURRENCY_LIMIT.load(Ordering::Acquire);
     let _global_permit = match try_acquire_atomic(
@@ -2053,15 +2243,21 @@ async fn mcp_root(headers: HeaderMap, body: Bytes) -> Response {
         }
     };
 
-    let mut response = mcp_root_inner(headers, body).await.into_response();
+    let mut response = mcp_root_inner(headers, body, pre_parsed).await.into_response();
 
     if let Ok(value) = HeaderValue::from_str(&request_id) {
         response.headers_mut().insert("x-request-id", value);
     }
 
+    response.headers_mut().insert(
+        "access-control-allow-origin",
+        HeaderValue::from_static("*"),
+    );
+
     let latency_ms = started_at.elapsed().as_millis() as u64;
     COMPLETED_HTTP_REQUESTS.fetch_add(1, Ordering::Relaxed);
     TOTAL_HTTP_LATENCY_MS.fetch_add(latency_ms, Ordering::Relaxed);
+    record_latency(latency_ms);
     log_http_request(
         &request_id,
         method.as_deref(),
@@ -2073,7 +2269,7 @@ async fn mcp_root(headers: HeaderMap, body: Bytes) -> Response {
     response
 }
 
-async fn mcp_root_inner(headers: HeaderMap, body: Bytes) -> impl IntoResponse {
+async fn mcp_root_inner(headers: HeaderMap, body: Bytes, pre_parsed: Option<Value>) -> impl IntoResponse {
     if !content_type_is_json(&headers) {
         return jsonrpc_error(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -2106,9 +2302,9 @@ async fn mcp_root_inner(headers: HeaderMap, body: Bytes) -> impl IntoResponse {
         );
     }
 
-    let parsed: Value = match serde_json::from_slice(&body) {
-        Ok(value) => value,
-        Err(_) => {
+    let parsed: Value = match pre_parsed {
+        Some(value) => value,
+        None => {
             let error = serde_json::json!({
                 "jsonrpc": "2.0",
                 "error": {
@@ -2188,6 +2384,69 @@ async fn mcp_root_inner(headers: HeaderMap, body: Bytes) -> impl IntoResponse {
     }
 
     // ---------------------------------------------------------
+    // MCP: notifications — fire-and-forget, no JSON-RPC response
+    // ---------------------------------------------------------
+    if method.starts_with("notifications/") {
+        return (
+            StatusCode::ACCEPTED,
+            [("content-type", "application/json")],
+            String::new(),
+        );
+    }
+
+    // ---------------------------------------------------------
+    // MCP: initialize — required lifecycle handshake
+    // ---------------------------------------------------------
+    if method == "initialize" {
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {
+                    "tools": { "listChanged": false },
+                    "resources": { "subscribe": false, "listChanged": false },
+                    "prompts": { "listChanged": false },
+                    "logging": {}
+                },
+                "serverInfo": {
+                    "name": "kurd",
+                    "version": env!("CARGO_PKG_VERSION")
+                },
+                "instructions": "Kurd is a high-performance MCP gateway powered by Rust."
+            }
+        });
+
+        return (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            response.to_string(),
+        );
+    }
+
+    // ---------------------------------------------------------
+    // MCP: completion/complete — argument autocomplete stub
+    // ---------------------------------------------------------
+    if method == "completion/complete" {
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "completion": {
+                    "values": [],
+                    "hasMore": false
+                }
+            }
+        });
+
+        return (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            response.to_string(),
+        );
+    }
+
+    // ---------------------------------------------------------
     // MCP: server/discover
     // ---------------------------------------------------------
     if method == "server/discover" {
@@ -2200,7 +2459,9 @@ async fn mcp_root_inner(headers: HeaderMap, body: Bytes) -> impl IntoResponse {
                     MCP_PROTOCOL_VERSION
                 ],
                 "capabilities": {
-                    "tools": {}
+                    "tools": {},
+                    "resources": {},
+                    "prompts": {}
                 },
                 "_meta": {
                     "io.modelcontextprotocol/serverInfo": {
@@ -2276,15 +2537,37 @@ async fn mcp_root_inner(headers: HeaderMap, body: Bytes) -> impl IntoResponse {
             left_name.cmp(right_name)
         });
 
+        let offset: usize = parsed
+            .get("params")
+            .and_then(|p| p.get("cursor"))
+            .and_then(|c| c.as_str())
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0)
+            .min(tools.len());
+
+        let page: Vec<Value> = tools[offset..]
+            .iter()
+            .take(TOOLS_LIST_PAGE_SIZE)
+            .cloned()
+            .collect();
+
+        let mut result_obj = serde_json::json!({
+            "resultType": "complete",
+            "tools": page,
+            "ttlMs": MCP_LIST_TTL_MS,
+            "cacheScope": MCP_CACHE_SCOPE
+        });
+
+        if offset + TOOLS_LIST_PAGE_SIZE < tools.len() {
+            result_obj["nextCursor"] = Value::String(
+                (offset + TOOLS_LIST_PAGE_SIZE).to_string()
+            );
+        }
+
         let response = serde_json::json!({
             "jsonrpc": "2.0",
             "id": request_id,
-            "result": {
-                "resultType": "complete",
-                "tools": tools,
-                "ttlMs": MCP_LIST_TTL_MS,
-                "cacheScope": MCP_CACHE_SCOPE
-            }
+            "result": result_obj
         });
 
         return (
@@ -2489,8 +2772,13 @@ async fn mcp_root_inner(headers: HeaderMap, body: Bytes) -> impl IntoResponse {
 
         match serialized {
             Ok(serialized) => {
-                let value: Value = serde_json::from_str(&serialized)
-                    .unwrap_or(Value::String(serialized));
+                // Parse into a Value so we can tell whether the tool returned
+                // a JSON string (needs no extra quoting) vs. another type.
+                let text = match serde_json::from_str::<Value>(&serialized) {
+                    Ok(Value::String(s)) => s,          // already a plain string
+                    Ok(other)            => other.to_string(), // number, bool, array, object
+                    Err(_)               => serialized,        // not valid JSON — use raw
+                };
 
                 let response = serde_json::json!({
                     "jsonrpc": "2.0",
@@ -2500,7 +2788,7 @@ async fn mcp_root_inner(headers: HeaderMap, body: Bytes) -> impl IntoResponse {
                         "content": [
                             {
                                 "type": "text",
-                                "text": value.to_string()
+                                "text": text
                             }
                         ],
                         "isError": false
@@ -2539,6 +2827,128 @@ async fn mcp_root_inner(headers: HeaderMap, body: Bytes) -> impl IntoResponse {
         }
     }
 
+
+    // ---------------------------------------------------------
+    // MCP: resources/list
+    // ---------------------------------------------------------
+    if method == "resources/list" {
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "resultType": "complete",
+                "resources": [],
+                "ttlMs": MCP_LIST_TTL_MS,
+                "cacheScope": MCP_CACHE_SCOPE
+            }
+        });
+
+        return (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            response.to_string(),
+        );
+    }
+
+    // ---------------------------------------------------------
+    // MCP: prompts/list
+    // ---------------------------------------------------------
+    if method == "prompts/list" {
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "resultType": "complete",
+                "prompts": [],
+                "ttlMs": MCP_LIST_TTL_MS,
+                "cacheScope": MCP_CACHE_SCOPE
+            }
+        });
+
+        return (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            response.to_string(),
+        );
+    }
+
+    // ---------------------------------------------------------
+    // MCP: resources/read — gateway holds no resources; return empty content
+    // ---------------------------------------------------------
+    if method == "resources/read" {
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "contents": []
+            }
+        });
+
+        return (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            response.to_string(),
+        );
+    }
+
+    // ---------------------------------------------------------
+    // MCP: prompts/get — gateway holds no prompts; return not-found error
+    // ---------------------------------------------------------
+    if method == "prompts/get" {
+        let name = parsed
+            .get("params")
+            .and_then(|p| p.get("name"))
+            .and_then(|n| n.as_str())
+            .unwrap_or("<unknown>");
+
+        let error = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {
+                "code": -32602,
+                "message": format!("Prompt '{}' not found", name)
+            }
+        });
+
+        return (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            error.to_string(),
+        );
+    }
+
+    // ---------------------------------------------------------
+    // MCP: logging/setLevel — accept, apply to tracing filter at runtime
+    // ---------------------------------------------------------
+    if method == "logging/setLevel" {
+        let level = parsed
+            .get("params")
+            .and_then(|p| p.get("level"))
+            .and_then(|l| l.as_str())
+            .unwrap_or("info");
+
+        // Best-effort: reload the global tracing env-filter.
+        let filter_str = match level {
+            "debug" | "verbose" => "kurd=debug",
+            "info"  | "notice"  => "kurd=info",
+            "warning"           => "kurd=warn",
+            "error" | "critical"| "alert" | "emergency" => "kurd=error",
+            _                   => "kurd=info",
+        };
+        let _ = std::env::set_var("KURD_LOG", filter_str);
+
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {}
+        });
+
+        return (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            response.to_string(),
+        );
+    }
 
     // ---------------------------------------------------------
     // Unknown method

@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "kurd"
-version = "0.5.0"
+version = "0.6.0"
 description = "Enterprise Model Context Protocol gateway with multi-tenancy, billing, RBAC, DLQ, idempotency, and secrets management."
 authors = [
     { name = "Semko Kermashani", email = "sn391@yahoo.com" }
@@ -15,7 +15,7 @@ requires-python = ">=3.10"
 dependencies = []
 keywords = ["mcp", "model-context-protocol", "gateway", "rust", "python", "ai"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
@@ -26,6 +26,9 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
 ]
 
+[project.scripts]
+kurd = "kurd.cli:main"
+
 [project.urls]
 Homepage = "https://github.com/sn391/kurd"
 Repository = "https://github.com/sn391/kurd"
@@ -33,3 +36,4 @@ Issues = "https://github.com/sn391/kurd/issues"
 
 [tool.maturin]
 module-name = "kurd._kurd"
+include = [{ path = "kurd/py.typed", format = ["wheel"] }]

@@ -1,52 +1,37 @@
-# Kurd
+# Kurd MCP
 
-A high-performance Model Context Protocol (MCP) gateway for Python, powered by Rust.
+[![PyPI](https://img.shields.io/pypi/v/kurd)](https://pypi.org/project/kurd/)
+[![Python](https://img.shields.io/pypi/pyversions/kurd)](https://pypi.org/project/kurd/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![CI](https://img.shields.io/github/actions/workflow/status/sn391/kurd/CI.yml?branch=main)](https://github.com/sn391/kurd/actions)
 
-Kurd combines a Python-first developer API with a Rust data plane for MCP routing, upstream aggregation, concurrency control, security, caching, and observability. The optional enterprise layer adds multi-tenancy, billing, idempotency, a dead-letter queue, secrets management, webhooks, distributed state, and distributed tracing.
+**Kurd** is a high-performance [Model Context Protocol](https://modelcontextprotocol.io) (MCP) gateway for Python, powered by Rust.
 
-## Status
+The Rust data plane handles HTTP serving, JSON-RPC dispatch, tool routing, upstream aggregation, caching, retries, circuit breaking, backpressure, rate limiting, and Prometheus metrics. The Python layer provides the developer API — tool registration, runtime configuration, and an optional enterprise feature set.
 
-Kurd is in **beta** and is being hardened for production use.
+> Targets MCP protocol revision **2026-07-28**. Fully typed (PEP 561).
 
-Current release line: **0.4.x**
+---
 
-The gateway targets the MCP **2026-07-28** protocol revision while preserving compatibility paths used by existing Kurd applications.
+## Contents
 
-## Highlights
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [CLI](#cli)
+- [Registering Tools](#registering-tools)
+- [Mounting Upstream Servers](#mounting-upstream-servers)
+- [Runtime Configuration](#runtime-configuration)
+- [Security](#security)
+- [Observability](#observability)
+- [MCP Protocol Compliance](#mcp-protocol-compliance)
+- [Enterprise Features](#enterprise-features)
+- [Performance](#performance)
+- [Architecture](#architecture)
+- [Development](#development)
+- [Project Structure](#project-structure)
+- [License](#license)
 
-### Core gateway
-
-- Python-first `Router` API
-- Rust core using Tokio, Axum, Serde, and Reqwest
-- MCP `server/discover`, `tools/list`, and `tools/call`
-- Local Python tools and mounted upstream MCP servers
-- Sync and async Python callbacks
-- Concurrent upstream discovery
-- Shared HTTP connection pool
-- Retry with exponential backoff and jitter
-- Circuit breaker
-- Tool-list caching with TTL and cache scope
-- Graceful HTTP lifecycle: start, stop, status, restart
-- Optional bearer authentication
-- Request-size and content-type validation
-- Upstream URL validation and private-network policy
-- Configurable upstream timeout
-- Global, per-upstream, and Python callback backpressure
-- Request IDs and structured request logging
-- Runtime, cache, and upstream metrics
-- Prometheus metrics export
-- Cross-platform CI and automated PyPI release workflow
-
-### Enterprise layer
-
-- Multi-tenancy with per-tenant API keys, quotas, and tool ACLs
-- Billing and usage tracking with configurable pricing models
-- Request idempotency (SQLite-backed, 24-hour result TTL)
-- Dead-letter queue with exponential-backoff replay
-- Secrets management (Kubernetes, HashiCorp Vault, AWS Secrets Manager, env)
-- Webhook notifications for gateway events
-- Distributed state (Redis or in-memory)
-- W3C-compatible distributed tracing context propagation
+---
 
 ## Installation
 
@@ -54,9 +39,92 @@ The gateway targets the MCP **2026-07-28** protocol revision while preserving co
 pip install kurd
 ```
 
-Python 3.10 or newer is required.
+Requires Python 3.10+ and a 64-bit platform. Pre-built wheels are available for Windows, Linux (x86-64, aarch64), and macOS (x86-64, Apple Silicon).
+
+---
 
 ## Quick Start
+
+```python
+from kurd import Router
+from kurd._kurd import start_http_gateway
+
+router = Router()
+
+@router.tool()
+async def add(a: int, b: int) -> int:
+    """Add two integers."""
+    return a + b
+
+# Blocks until stop_http_gateway() is called or the process exits.
+start_http_gateway("0.0.0.0:9200")
+```
+
+The gateway starts three endpoints:
+
+| Path | Method | Purpose |
+|------|--------|---------|
+| `/mcp` | `POST` | JSON-RPC 2.0 MCP endpoint |
+| `/health` | `GET` | Liveness probe — returns `200 OK` |
+| `/status` | `GET` | Runtime, cache, upstream, and circuit-breaker snapshot |
+| `/metrics` | `GET` | Prometheus metrics |
+
+Call the gateway:
+
+```bash
+curl -s http://localhost:9200/mcp \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"add","arguments":{"a":3,"b":4}}}'
+```
+
+```json
+{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","content":[{"type":"text","text":"7"}],"isError":false}}
+```
+
+---
+
+## CLI
+
+Kurd ships a `kurd` command installed alongside the package.
+
+```
+Usage: kurd <COMMAND>
+
+Commands:
+  serve   Start the HTTP MCP gateway
+
+Options:
+  -h, --help  Show this message and exit
+```
+
+### `kurd serve`
+
+```bash
+kurd serve [--host HOST] [--port PORT] [--token TOKEN]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--host` | `0.0.0.0` | Bind address |
+| `--port` | `8000` | Bind port |
+| `--token` | — | Bearer token for authentication (overrides `KURD_AUTH_TOKEN`) |
+
+```bash
+# Start on port 8000 with no authentication
+kurd serve
+
+# Start on a specific address with a bearer token
+kurd serve --host 127.0.0.1 --port 9200 --token my-secret
+
+# Use an environment variable for the token
+KURD_AUTH_TOKEN=my-secret kurd serve --port 9200
+```
+
+---
+
+## Registering Tools
+
+### Decorator API
 
 ```python
 from kurd import Router
@@ -64,303 +132,443 @@ from kurd import Router
 router = Router()
 
 @router.tool()
-async def add(a: int, b: int) -> int:
-    return a + b
+async def search(query: str, limit: int = 10) -> list[str]:
+    """Search the knowledge base."""
+    return [f"result {i}" for i in range(limit)]
 ```
 
-Start the HTTP gateway:
+Type annotations are converted to a JSON Schema `inputSchema` automatically:
+
+| Python type | JSON Schema type |
+|-------------|-----------------|
+| `int` | `integer` |
+| `float` | `number` |
+| `bool` | `boolean` |
+| `str` | `string` |
+| `list[T]` | `array` with item schema |
+| `dict` | `object` |
+| `Optional[T]` / `T \| None` | schema of `T` |
+
+Parameters with defaults become optional; parameters without defaults are added to `required`.
+
+### Hot-reloading
+
+Replace a tool's implementation at runtime without restarting the gateway:
 
 ```python
-from kurd._kurd import start_http_gateway
-
-start_http_gateway("127.0.0.1:9200")
+router.reload_tool("search", new_search_function)
 ```
 
-The MCP endpoint is:
-
-```text
-http://127.0.0.1:9200/mcp
-```
-
-Health and operational status are exposed at:
-
-```text
-GET /health
-GET /status
-GET /metrics
-```
-
-The `/metrics` endpoint exports Prometheus-format metrics for integration with monitoring systems (Datadog, Prometheus, New Relic, etc.).
-
-## Mount an Upstream MCP Server
+### Unregistering
 
 ```python
-from kurd import Router
-
-router = Router()
-router.mount("github", "http://127.0.0.1:9300")
+router.unregister_tool("search")
 ```
 
-An upstream tool named `create_issue` is exposed through Kurd as:
+### Introspection
+
+```python
+router.list_tools()      # -> ["add", "search", ...]
+router.list_upstreams()  # -> [("github", "http://..."), ...]
+```
+
+---
+
+## Mounting Upstream Servers
+
+Kurd aggregates remote MCP servers alongside local tools.
+
+```python
+router.mount("github", "http://github-mcp.internal:9300")
+router.mount("jira",   "http://jira-mcp.internal:9300")
+```
+
+Upstream tools are prefixed with the upstream name:
 
 ```text
 github.create_issue
+jira.create_ticket
 ```
 
-Unmount or refresh the aggregated tool cache:
+Clients discover all tools — local and upstream — through a single `tools/list` call. Kurd fetches remote tool lists concurrently, caches them with a configurable TTL, and follows pagination automatically.
+
+### Unmounting and cache invalidation
 
 ```python
-router.unmount("github")
-router.refresh_tools()
+router.unmount("github")   # stop routing to this upstream
+router.refresh_tools()     # expire the tool list cache immediately
 ```
 
-## Runtime Hardening
+### Upstream behaviour
 
-Kurd provides explicit concurrency controls:
+- **Connection pool**: persistent HTTP/1.1 connections via Reqwest
+- **Retry**: up to 3 attempts with exponential backoff + jitter
+- **Circuit breaker**: opens after 5 consecutive failures; resets after 30 s
+- **Timeout**: configurable per `RuntimeConfig.upstream_timeout_ms`
+- **Private-network policy**: loopback/private URLs blocked by default unless `set_allow_private_upstreams(True)` is called
+
+---
+
+## Runtime Configuration
+
+All gateway tunables are collected in `RuntimeConfig`:
 
 ```python
-router.configure_runtime(
-    global_concurrency=512,
-    upstream_concurrency=64,
-    python_concurrency=64,
-    request_logging=False,
-)
+from kurd import Router, RuntimeConfig
+
+router = Router()
+router.configure_runtime(RuntimeConfig(
+    # Concurrency
+    global_concurrency   = 512,   # max simultaneous in-flight requests
+    upstream_concurrency = 64,    # max simultaneous upstream calls
+    python_concurrency   = 64,    # max simultaneous Python tool calls
+    upstream_timeout_ms  = 30_000,
+
+    # Logging
+    request_logging      = False, # structured per-request log lines
+
+    # Rate limiting
+    rate_limiting_enabled   = True,
+    rate_limit_per_ip_rps   = 1_000,
+    rate_limit_global_rps   = 10_000,
+
+    # IP allowlist (None = allow all)
+    ip_allowlist         = ["192.168.1.0/24", "10.0.0.1"],
+
+    # Tool cache
+    tools_cache_ttl_ms   = 30_000,
+
+    # Enterprise (all off by default)
+    enable_dlq                  = False,
+    enable_idempotency          = False,
+    secrets_backend             = "env",
+    enable_webhooks             = False,
+    enable_distributed_state    = False,
+    distributed_state_backend   = "memory",
+    redis_url                   = "redis://localhost:6379/0",
+    enable_distributed_tracing  = False,
+))
 ```
 
-Inspect runtime state:
+`configure_runtime` also accepts keyword arguments directly for ergonomic one-liners:
 
 ```python
-print(router.runtime_status())
+router.configure_runtime(request_logging=True, rate_limiting_enabled=True)
 ```
 
-The HTTP `/status` endpoint also reports runtime, cache, security, upstream latency, retry, and circuit-breaker metrics.
+### Runtime status
+
+```python
+status = router.runtime_status()
+# {
+#   "global_active": 3,
+#   "global_limit": 512,
+#   "python_active": 1,
+#   "upstream_metrics": {...},
+#   "cache": {"hits": 142, "misses": 3},
+#   ...
+# }
+```
+
+---
 
 ## Security
 
-Kurd provides a production security baseline:
+### Bearer token authentication
 
-- maximum MCP request body size (1 MiB)
-- JSON content-type validation
-- optional bearer-token authentication with constant-time comparison
-- upstream URL validation (scheme, credentials, fragment)
-- configurable private/loopback upstream policy
-- configurable upstream request timeout
-- sanitized upstream transport errors
-- overload rejection through explicit backpressure
-- per-IP and global rate limiting
+Set a bearer token before starting the gateway. Requests missing or carrying a wrong token receive `401 Unauthorized`.
 
-For deployments exposed beyond localhost, use TLS at the reverse proxy or ingress layer and apply your normal network-level authentication and authorization controls.
+```python
+from kurd._kurd import set_http_bearer_token, clear_http_bearer_token
 
-## Observability & Monitoring
-
-### Prometheus Metrics Export
-
-Kurd exports metrics in Prometheus format at the `/metrics` endpoint:
-
-```bash
-curl http://127.0.0.1:9200/metrics
+set_http_bearer_token("my-production-token")
+# clear_http_bearer_token()  # disable authentication
 ```
 
-**Available metrics:**
+Via environment variable (loaded automatically at gateway start):
 
-- `kurd_requests_total` - Total HTTP requests (total, completed, rejected)
-- `kurd_requests_active` - Currently active requests
-- `kurd_requests_peak_active` - Peak concurrent requests
-- `kurd_request_latency_ms` - Average request latency
-- `kurd_python_active_calls` - Active Python tool calls
-- `kurd_python_rejections_total` - Python tool call rejections
-- `kurd_upstream_requests_total` - Requests to upstream servers (per upstream)
-- `kurd_upstream_successes_total` - Successful upstream calls
-- `kurd_upstream_failures_total` - Failed upstream calls
-- `kurd_upstream_retries_total` - Upstream call retries
-- `kurd_upstream_latency_ms` - Average upstream latency
-- `kurd_upstream_circuit_breaker_state` - Circuit breaker state (0=closed, 1=open)
-- `kurd_cache_hits_total` - Tool discovery cache hits
-- `kurd_cache_misses_total` - Tool discovery cache misses
-- `kurd_cache_invalidations_total` - Cache invalidations
-- `kurd_concurrency_limit` - Configured concurrency limits
+```bash
+KURD_AUTH_TOKEN=my-production-token kurd serve
+```
 
-**Integration example (Prometheus):**
+Tokens are compared with a constant-time byte comparison to prevent timing attacks.
+
+### IP allowlist
+
+```python
+from kurd import set_ip_allowlist, clear_ip_allowlist
+
+set_ip_allowlist(["10.0.0.1", "10.0.0.2"])
+clear_ip_allowlist()  # allow all IPs again
+```
+
+Or through `RuntimeConfig.ip_allowlist`. Blocked IPs receive `403 Forbidden`.
+
+### Rate limiting
+
+```python
+router.configure_runtime(
+    rate_limiting_enabled=True,
+    rate_limit_per_ip_rps=1_000,
+    rate_limit_global_rps=10_000,
+)
+```
+
+Rate-limited requests receive `429 Too Many Requests` with a `Retry-After: 1` header and a `retryAfterMs` field in the JSON-RPC error body.
+
+### Additional safeguards
+
+| Safeguard | Details |
+|-----------|---------|
+| Request size cap | 1 MiB hard limit; `413` on excess |
+| Content-type validation | Must be `application/json`; `-32600` otherwise |
+| Upstream URL validation | Rejects credentials, fragments, and unsupported schemes |
+| Private-network policy | Upstream calls to loopback/RFC1918 blocked by default |
+| CORS | `OPTIONS /mcp` returns correct preflight headers; `POST` responses include `Access-Control-Allow-Origin: *` |
+| Overload rejection | `503` when global concurrency limit is reached |
+
+For internet-facing deployments, terminate TLS at a reverse proxy (nginx, Caddy, AWS ALB) and apply network-level controls there.
+
+---
+
+## Observability
+
+### Structured logging
+
+Enable per-request log lines (goes to stdout in the format chosen by `KURD_LOG`):
+
+```python
+router.configure_runtime(request_logging=True)
+```
+
+Control log verbosity via environment variable:
+
+```bash
+KURD_LOG=kurd=debug kurd serve   # debug, info, warn, error
+RUST_LOG=info kurd serve         # fallback if KURD_LOG is unset
+```
+
+Log level can also be changed at runtime via the `logging/setLevel` MCP method.
+
+### Prometheus metrics
+
+```bash
+curl http://localhost:9200/metrics
+```
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `kurd_requests_total{status}` | counter | Total requests by status (`total`, `completed`, `rejected`) |
+| `kurd_requests_active` | gauge | In-flight requests right now |
+| `kurd_requests_peak_active` | gauge | Highest concurrent request count since startup |
+| `kurd_request_latency_ms` | gauge | Rolling average latency (ms) |
+| `kurd_request_latency_histogram_ms_bucket{le}` | histogram | Latency distribution (1ms … 5000ms + Inf) |
+| `kurd_request_latency_histogram_ms_count` | counter | Total completed requests counted in histogram |
+| `kurd_request_latency_histogram_ms_sum` | counter | Total latency (ms) summed across all requests |
+| `kurd_python_active_calls` | gauge | Active Python tool invocations |
+| `kurd_python_peak_active_calls` | gauge | Peak simultaneous Python tool invocations |
+| `kurd_python_rejections_total` | counter | Python tool calls dropped due to concurrency limit |
+| `kurd_upstream_requests_total{upstream}` | counter | Requests forwarded per upstream |
+| `kurd_upstream_successes_total{upstream}` | counter | Successful upstream calls |
+| `kurd_upstream_failures_total{upstream}` | counter | Failed upstream calls |
+| `kurd_upstream_retries_total{upstream}` | counter | Retry attempts per upstream |
+| `kurd_upstream_latency_ms{upstream}` | gauge | Average upstream round-trip latency |
+| `kurd_upstream_circuit_breaker_state{upstream}` | gauge | `0` = closed, `1` = open |
+| `kurd_upstream_active_calls{upstream}` | gauge | Current in-flight calls per upstream |
+| `kurd_upstream_peak_active_calls{upstream}` | gauge | Peak in-flight calls per upstream |
+| `kurd_upstream_rejections_total` | counter | Upstream calls dropped due to concurrency limit |
+| `kurd_cache_hits_total` | counter | Tool-list cache hits |
+| `kurd_cache_misses_total` | counter | Tool-list cache misses |
+| `kurd_cache_invalidations_total` | counter | Cache invalidations (manual or TTL expiry) |
+| `kurd_concurrency_limit{type}` | gauge | Configured limits: `global`, `upstream`, `python` |
+
+#### Prometheus scrape config
 
 ```yaml
 # prometheus.yml
 scrape_configs:
-  - job_name: 'kurd'
+  - job_name: kurd
     static_configs:
-      - targets: ['127.0.0.1:9200']
-    metrics_path: '/metrics'
+      - targets: ["localhost:9200"]
+    metrics_path: /metrics
+    scrape_interval: 15s
 ```
 
-**Integration example (Datadog):**
+#### Datadog
 
 ```yaml
 # datadog.yaml
-openmetrics_endpoint: http://127.0.0.1:9200/metrics
+instances:
+  - openmetrics_endpoint: http://localhost:9200/metrics
+    namespace: kurd
+    metrics: ["kurd_.*"]
 ```
 
-## MCP 2026-07-28
+### OpenTelemetry
 
-Kurd implements the stateless 2026 MCP model used for routable gateway traffic:
+```python
+from kurd.telemetry import setup_otel, OTELConfig
 
-- per-request protocol metadata
-- `MCP-Protocol-Version`
-- `Mcp-Method`
-- `Mcp-Name` for tool calls
-- `server/discover`
-- deterministic `tools/list`
-- `resultType`
-- `ttlMs`
-- `cacheScope`
-- server identity metadata
+setup_otel(OTELConfig(
+    service_name    = "my-gateway",
+    otlp_endpoint   = "http://otel-collector:4317",
+    sample_rate     = 1.0,
+))
+```
 
-Kurd rejects mismatched modern MCP headers and unsupported protocol versions.
+`OTELConfig.service_version` defaults to the installed `kurd` package version automatically.
+
+### Health checks
+
+```python
+from kurd.health_checks import HealthCheckManager
+
+hc = HealthCheckManager()
+
+# Register a custom check
+async def check_db():
+    ...
+
+hc.register_check("database", check_db, critical=True)
+
+# Kubernetes probes
+readiness = await hc.check_readiness()  # all critical checks pass
+liveness  = await hc.check_liveness()   # process is running and active
+```
+
+---
+
+## MCP Protocol Compliance
+
+Kurd implements the MCP **2026-07-28** protocol revision.
+
+### Supported methods
+
+| Method | Behaviour |
+|--------|-----------|
+| `initialize` | Returns `protocolVersion`, `capabilities`, and `serverInfo` |
+| `ping` | Returns `{}` |
+| `server/discover` | Returns capabilities, supported versions, and server identity |
+| `tools/list` | Aggregates local + upstream tools; supports cursor-based pagination |
+| `tools/call` | Routes to local Python tool or upstream server |
+| `resources/list` | Returns empty list with `ttlMs` and `cacheScope` |
+| `resources/read` | Returns `{"contents": []}` |
+| `prompts/list` | Returns empty list with `ttlMs` and `cacheScope` |
+| `prompts/get` | Returns `-32602` (gateway holds no prompts) |
+| `completion/complete` | Returns `{"values": [], "hasMore": false}` |
+| `logging/setLevel` | Applies log level to the tracing filter at runtime |
+| `notifications/*` | Accepted silently — returns `202 Accepted` with empty body |
+
+### Modern HTTP headers
+
+When a client sends `Mcp-Protocol-Version: 2026-07-28`, Kurd additionally validates:
+
+- `Mcp-Method` header matches the JSON-RPC `method` field
+- `Mcp-Name` header matches `params.name` for `tools/call`
+
+Mismatched headers return `-32020`. Unsupported protocol versions return `-32019`.
+
+---
 
 ## Enterprise Features
 
-### Multi-Tenancy
+Enable features through `RuntimeConfig` or by importing the relevant manager class directly.
 
-Isolate tools, quotas, and API keys per tenant:
+### Multi-tenancy
 
 ```python
 from kurd.multitenancy import TenantManager
 
 manager = TenantManager()
 api_key = manager.add_tenant(
-    tenant_id="acme-corp",
+    tenant_id="acme",
     name="Acme Corp",
     quota_rps=100,
-    allowed_tools=["add", "multiply"],
+    allowed_tools=["add", "search"],
 )
 ```
 
-Each tenant gets a unique API key. The manager enforces per-tenant RPS quotas and tool access control lists independently.
+Each tenant receives a unique API key. Quotas and tool ACLs are enforced independently.
 
-### Billing & Usage Tracking
-
-Track tool usage per tenant with configurable pricing:
+### Billing
 
 ```python
 from kurd.billing import BillingManager
 
 billing = BillingManager()
-billing.set_pricing({
-    "add": {"per_call": 0.001, "per_latency_ms": 0.0001},
-})
+billing.set_pricing({"add": {"per_call": 0.001, "per_latency_ms": 0.0001}})
+billing.track_call(tenant_id="acme", tool_name="add", latency_ms=12.5, success=True)
 
-billing.track_call(
-    tenant_id="acme-corp",
-    tool_name="add",
-    latency_ms=25.5,
-    success=True,
-)
-
-report = billing.get_usage_report("acme-corp", period="2026-08")
+report = billing.get_usage_report("acme", period="2026-08")
 ```
 
-Supported billing models: per-request, per-latency, tiered, and hybrid.
+Supported models: per-request, per-latency, tiered, hybrid.
 
-### Request Idempotency
-
-Prevent duplicate tool executions using idempotency keys:
+### Request idempotency
 
 ```python
 router.configure_runtime(enable_idempotency=True)
-idempotency = router.get_idempotency()
+mgr = router.get_idempotency()
 
-is_duplicate, cached = idempotency.check_idempotent_key(
-    idempotency_key="req-abc-123",
-    tenant_id="acme-corp",
-)
-if is_duplicate:
+is_dup, cached = mgr.check_idempotent_key("req-abc-123", tenant_id="acme")
+if is_dup:
     return cached
 
-result = process_request()
-idempotency.store_result("req-abc-123", "acme-corp", result)
+result = run_tool()
+mgr.store_result("req-abc-123", "acme", result)
 ```
 
-Results are stored in SQLite with a 24-hour TTL by default.
+Backed by SQLite with a 24-hour TTL.
 
-### Dead-Letter Queue
-
-Capture failed requests for later replay:
+### Dead-letter queue
 
 ```python
 router.configure_runtime(enable_dlq=True, dlq_storage_path="/data/kurd/dlq")
 dlq = router.get_dlq()
 
-dlq.add_message(
-    request_id="req-123",
-    tenant_id="acme-corp",
-    tool_name="add",
-    arguments={"a": 1, "b": 2},
-    error="Timeout after 30s",
-)
+dlq.add_message(request_id="req-123", tenant_id="acme",
+                tool_name="add", arguments={"a":1,"b":2}, error="timeout")
 
-dlq.register_replay_handler("add", add_handler)
+dlq.register_replay_handler("add", handler)
 success, error = dlq.replay_message("dlq_abc123")
 
-pending = dlq.get_pending_replays()
-stats = dlq.get_statistics(tenant_id="acme-corp")
+stats = dlq.get_statistics(tenant_id="acme")
+dlq.cleanup_archived(days=30)
 ```
 
-Replay uses exponential backoff (up to 1 hour) and a configurable maximum retry count. Archived messages are cleaned up via `cleanup_archived(days=30)`.
+Replay uses exponential backoff up to 1 hour.
 
-### Secrets Management
-
-Retrieve secrets from Kubernetes, HashiCorp Vault, AWS Secrets Manager, or environment variables:
+### Secrets management
 
 ```python
 from kurd.secrets_management import SecretsManager
 
-# Kubernetes (in-cluster)
-manager = SecretsManager(backend="kubernetes")
-
-# HashiCorp Vault
-manager = SecretsManager(
-    backend="vault",
-    vault_addr="https://vault.example.com",
-    vault_token="s.xxxxx",
-)
-
-# AWS Secrets Manager
-manager = SecretsManager(backend="aws", aws_region="us-east-1")
-
-# Environment variables (default)
-manager = SecretsManager(backend="env")
+# Kubernetes in-cluster | HashiCorp Vault | AWS Secrets Manager | env (default)
+manager = SecretsManager(backend="vault",
+                          vault_addr="https://vault.example.com",
+                          vault_token="s.xxxxx")
 
 secret = manager.get_secret("db_password")
 ```
 
-Secrets are cached locally until `clear_cache()` is called. Required third-party packages (`kubernetes`, `hvac`, `boto3`) are only imported when the corresponding backend is activated.
+Third-party dependencies (`kubernetes`, `hvac`, `boto3`) are imported lazily — only when the matching backend is activated.
 
 ### Webhooks
 
-Receive event-driven notifications for gateway events:
-
 ```python
 router.configure_runtime(enable_webhooks=True)
-webhooks = router.get_webhooks()
+hooks = router.get_webhooks()
 
-webhooks.register_webhook(
+hooks.register_webhook(
     url="https://example.com/hooks",
-    events=["error", "dlq_replay_failed", "rate_limit_exceeded"],
-    tenant_id="acme-corp",
-)
-
-webhooks.trigger_event(
-    event_type="error",
-    tenant_id="acme-corp",
-    data={"tool": "add", "error": "timeout"},
+    events=["error", "rate_limit_exceeded"],
+    tenant_id="acme",
 )
 ```
 
-Supported events: `error`, `dlq_message_added`, `dlq_replay_success`, `dlq_replay_failed`, `rate_limit_exceeded`, `health_check_failed`, `request_timeout`, `authorization_failed`, `idempotent_duplicate`.
+Deliveries are HMAC-SHA256 signed and logged for audit via `get_deliveries()`.
 
-Deliveries are signed with HMAC-SHA256 and stored for audit via `get_deliveries()`.
-
-### Distributed State
-
-Share state across multiple Kurd instances using Redis or in-memory storage:
+### Distributed state
 
 ```python
 router.configure_runtime(
@@ -369,155 +577,165 @@ router.configure_runtime(
     redis_url="redis://localhost:6379/0",
 )
 state = router.get_distributed_state()
-
-state.set("gateway:config:version", 42)
-version = state.get("gateway:config:version")
-
-state.increment("counters:acme-corp:calls")
-state.append_to_list("events:acme-corp", {"type": "tool_call"})
+state.set("gateway:version", 42)
+state.increment("counters:acme:calls")
 ```
 
-Use the `memory` backend for local development or single-instance deployments.
+Use `backend="memory"` for single-instance deployments.
 
-### Distributed Tracing
-
-Propagate W3C Trace Context across services:
+### Distributed tracing
 
 ```python
-from kurd.distributed_tracing import extract_context, inject_context
+from kurd.distributed_tracing import extract_context
 
 trace = extract_context(incoming_headers)
-span = trace.create_span("tool_execution", {"tool": "add"})
+span  = trace.create_span("tool_execution", {"tool": "add"})
 span.set_attribute("result", 42)
 span.end()
-
-upstream_headers = inject_context(trace)
 ```
 
-Tracing context is accessible from `router.get_tracing_context()` and is included in `runtime_status()` output when enabled.
+Follows W3C Trace Context. Tracing state is available in `router.runtime_status()` when enabled.
+
+---
 
 ## Performance
 
-The repository includes end-to-end HTTP load tests in `tests/test_load.py`.
-
-Example measurements from a Windows development machine:
+Benchmarks from a Windows development machine (Python 3.12, release build):
 
 | Scenario | Concurrency | Throughput | p50 | p95 | p99 | Errors |
 |---|---:|---:|---:|---:|---:|---:|
-| Local Python tool | 10 | 594.5 req/s | 14.94 ms | 23.88 ms | 28.66 ms | 0% |
-| Local Python tool | 50 | 587.9 req/s | 33.29 ms | 87.83 ms | 119.09 ms | 0% |
-| Local Python tool | 100 | 556.0 req/s | 18.27 ms | 29.52 ms | 32.43 ms | 0% |
-| Upstream tool | 10 | 412.2 req/s | 21.77 ms | 36.35 ms | 42.74 ms | 0% |
-| Upstream tool | 50 | 229.8 req/s | 20.61 ms | 534.61 ms | 549.25 ms | 0% |
-| Upstream tool | 100 | 293.6 req/s | 30.12 ms | 531.40 ms | 535.40 ms | 0% |
-| Local sustained burst | 100 | 573.3 req/s | 73.51 ms | 179.13 ms | 218.49 ms | 0% |
+| Local Python tool | 10 | 594.5 req/s | 14.9 ms | 23.9 ms | 28.7 ms | 0% |
+| Local Python tool | 50 | 587.9 req/s | 33.3 ms | 87.8 ms | 119.1 ms | 0% |
+| Local Python tool | 100 | 556.0 req/s | 18.3 ms | 29.5 ms | 32.4 ms | 0% |
+| Upstream tool | 10 | 412.2 req/s | 21.8 ms | 36.4 ms | 42.7 ms | 0% |
+| Upstream tool | 50 | 229.8 req/s | 20.6 ms | 534.6 ms | 549.3 ms | 0% |
+| Sustained burst | 100 | 573.3 req/s | 73.5 ms | 179.1 ms | 218.5 ms | 0% |
 
-These are local measurements, not universal performance guarantees. Hardware, operating system, Python version, payload shape, upstream implementation, and network conditions affect results.
-
-Run the benchmark suite with:
+Results depend on hardware, OS, Python version, and network conditions.
 
 ```bash
 python -m pytest tests/test_load.py -q -s
 ```
 
+---
+
+## Architecture
+
+```
+Python application
+       │
+       ▼
+  kurd.Router                      ← Python API layer
+       │
+       ├── Enterprise modules (optional, lazy)
+       │   multitenancy · billing · idempotency · DLQ
+       │   secrets · webhooks · distributed state · tracing
+       │
+       ▼
+   PyO3 boundary
+       │
+       ▼
+  Rust MCP gateway (Axum + Tokio)
+       │
+       ├── HTTP handler  ─────────────────────────────────┐
+       │   content-type · auth · IP allowlist              │
+       │   rate limiting · concurrency backpressure        │
+       │   CORS · request ID · tracing                     │
+       │                                                   │
+       ├── MCP dispatcher                                  │
+       │   initialize · ping · server/discover             │
+       │   tools/list (paginated) · tools/call             │
+       │   resources · prompts · completion · logging      │
+       │   notifications (202)                             │
+       │                                                   │
+       ├── Local Python tools ◄── PyO3 callback            │
+       │   (Rayon-parallel batch parsing)                  │
+       │                                                   │
+       └── Upstream MCP servers                           │
+           retry · circuit breaker · cache · metrics      ◄┘
+```
+
+The Rust layer holds all mutable gateway state in lock-free atomics and `RwLock`-guarded maps. Python code never touches the hot path after registration.
+
+---
+
 ## Development
 
-Create and activate a virtual environment, then install the development tools:
+### Prerequisites
+
+- Rust stable toolchain (`rustup update stable`)
+- Python 3.10+
+- `maturin` and `pytest`
 
 ```bash
-python -m pip install --upgrade pip
-python -m pip install maturin pytest
+pip install maturin pytest
 ```
 
-Build the native extension:
+### Build
 
 ```bash
+# Development build (fast iteration)
+maturin develop
+
+# Optimised build (benchmarks, pre-release testing)
 maturin develop --release
+
+# Release wheel
+maturin build --release
 ```
 
-Run the full test suite:
+### Test
 
 ```bash
 python -m pytest -q
 ```
 
-Build release artifacts:
+The test suite covers:
+
+- JSON-RPC parsing and fast batch parsing (Rayon)
+- Local sync and async tools
+- `initialize` handshake and lifecycle methods
+- `tools/list` pagination
+- `completion/complete`, `notifications/202`, CORS preflight
+- Upstream discovery, routing, and concurrency
+- Circuit breaker, retry, and timeout behaviour
+- Tool-list cache hits, misses, and invalidation
+- Bearer authentication (accepted and rejected)
+- IP allowlist enforcement
+- Rate-limit rejection and `Retry-After` header
+- Request-size and content-type guards
+- Prometheus metrics output
+- Load and burst behaviour
+
+### Linting
 
 ```bash
-maturin build --release
+cargo check
+cargo clippy -- -D warnings
 ```
 
-## Architecture
+### Environment variables
 
-```text
-Python application
-       |
-       v
-   Kurd Router
-   (Python API layer)
-       |
-       +-- Enterprise modules (optional)
-       |   multitenancy, billing, idempotency,
-       |   DLQ, secrets, webhooks,
-       |   distributed state, tracing
-       |
-       v
-   PyO3 boundary
-       |
-       v
- Rust MCP gateway
-   |          |
-   |          +--> Local Python tools
-   |
-   +-------------> Upstream MCP servers
-```
+| Variable | Purpose |
+|----------|---------|
+| `KURD_AUTH_TOKEN` | Bearer token loaded automatically at gateway start |
+| `KURD_LOG` | Tracing filter (e.g. `kurd=debug`). Takes precedence over `RUST_LOG` |
+| `RUST_LOG` | Standard Rust log filter fallback |
 
-Rust owns the HTTP server, MCP validation, routing, caching, retries, circuit breaking, backpressure, rate limiting, and operational metrics. Python provides the developer-facing registration, configuration, and enterprise-feature APIs.
-
-## Testing
-
-The current suite covers:
-
-- JSON-RPC parsing and dispatch
-- local sync and async tools
-- upstream discovery and calls
-- concurrent upstream discovery
-- cache behavior and invalidation
-- mount and unmount
-- MCP 2026 request headers and protocol-version checks
-- HTTP lifecycle and graceful shutdown
-- request-size and content-type security
-- bearer authentication
-- upstream URL policy
-- timeout configuration
-- error sanitization
-- global and Python callback backpressure
-- request ID propagation
-- runtime observability
-- Prometheus metrics export
-- load and burst behavior
-
-## Compatibility
-
-CI targets Windows, Linux, and macOS. Release wheels are built through Maturin.
-
-The project is primarily developed with Python 3.12 and stable Rust; package metadata supports Python 3.10+.
-
-## Release Policy
-
-Kurd uses semantic versioning while the public API stabilizes.
-
-- patch releases: bug fixes and packaging corrections
-- minor releases: new gateway or MCP capabilities
-- `1.0.0`: stable public API commitment
+---
 
 ## Project Structure
 
-```text
-kurd/
+```
+kurd-mcp/
 ├── kurd/
-│   ├── __init__.py
-│   ├── router.py
+│   ├── __init__.py            # Public API + __version__
+│   ├── py.typed               # PEP 561 marker
+│   ├── cli.py                 # `kurd serve` entry point
+│   ├── router.py              # Router class + RuntimeConfig
+│   ├── telemetry.py           # OpenTelemetry integration
+│   ├── health_checks.py       # Readiness and liveness probes
+│   ├── authorization.py       # RBAC helpers
 │   ├── multitenancy.py
 │   ├── billing.py
 │   ├── idempotency.py
@@ -526,50 +744,45 @@ kurd/
 │   ├── webhooks.py
 │   ├── distributed_state.py
 │   ├── distributed_tracing.py
-│   ├── api_key_management.py
-│   ├── audit_logging.py
-│   ├── authorization.py
-│   ├── error_recovery.py
-│   ├── graceful_shutdown.py
-│   ├── health_checks.py
-│   ├── persistence.py
-│   ├── request_response_logging.py
-│   ├── request_validation.py
-│   ├── resource_limits.py
-│   ├── telemetry.py
-│   └── tls_management.py
+│   └── ...
 ├── src/
-│   └── lib.rs
+│   └── lib.rs                 # Rust data plane (~2600 lines)
 ├── tests/
 │   ├── test_core.py
+│   ├── test_http_gateway.py   # Integration tests (module-scoped gateway)
 │   ├── test_upstream.py
 │   ├── test_load.py
 │   ├── test_prometheus_metrics.py
-│   └── upstream_server.py
+│   └── upstream_server.py     # In-process upstream fixture
 ├── Cargo.toml
 ├── pyproject.toml
-├── README.md
-└── LICENSE
+├── LICENSE
+└── README.md
 ```
+
+---
 
 ## Contributing
 
-Issues and technical discussions are welcome through the GitHub issue tracker.
+Issues and pull requests are welcome via the [GitHub repository](https://github.com/sn391/kurd).
 
-Before submitting a change:
+Before submitting:
 
 ```bash
 cargo check
+cargo clippy -- -D warnings
 maturin develop --release
 python -m pytest -q
 ```
 
+Please open an issue before starting large changes.
+
+---
+
 ## License
 
-MIT.
+[MIT](LICENSE) — Copyright © 2024 Semko Kermashani
 
-## Name
+---
 
-The name **Kurd** honors Kurdish identity and heritage.
-
-Bezhi Kurd u Kurdistan.
+*The name **Kurd** honors Kurdish identity and heritage. Bezhi Kurd u Kurdistan.*

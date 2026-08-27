@@ -1,7 +1,8 @@
 import asyncio
 import json
 import inspect
-from typing import get_args, get_origin, Union
+from dataclasses import dataclass, field
+from typing import get_args, get_origin, Union, Optional
 import types
 from typing import Callable, Dict, Any, Coroutine
 from kurd._kurd import (
@@ -14,14 +15,45 @@ from kurd._kurd import (
     set_runtime_limits,
     set_request_logging,
     set_rate_limiting,
+    set_tools_cache_ttl_ms,
+    set_upstream_timeout_ms as _rust_set_upstream_timeout_ms,
     runtime_status,
     init_python_async_runtime,
+    list_upstreams as _rust_list_upstreams,
+    list_tools as _rust_list_tools,
+    set_ip_allowlist as _rust_set_ip_allowlist,
+    clear_ip_allowlist as _rust_clear_ip_allowlist,
 )
+
+
+@dataclass
+class RuntimeConfig:
+    """All runtime options for a Kurd gateway in one place."""
+    global_concurrency: int = 512
+    upstream_concurrency: int = 64
+    python_concurrency: int = 64
+    request_logging: bool = False
+    rate_limiting_enabled: bool = False
+    rate_limit_per_ip_rps: int = 1000
+    rate_limit_global_rps: int = 10_000
+    tools_cache_ttl_ms: int = 30_000
+    enable_dlq: bool = False
+    enable_idempotency: bool = False
+    secrets_backend: str = "env"
+    dlq_storage_path: Optional[str] = None
+    idempotency_storage_path: Optional[str] = None
+    enable_webhooks: bool = False
+    enable_distributed_state: bool = False
+    distributed_state_backend: str = "memory"
+    redis_url: str = "redis://localhost:6379/0"
+    enable_distributed_tracing: bool = False
+    ip_allowlist: Optional[list] = None
+    upstream_timeout_ms: int = 30_000
 from kurd.dead_letter_queue import DeadLetterQueue
 from kurd.idempotency import IdempotencyManager
 from kurd.secrets_management import SecretsManager
 from kurd.webhooks import WebhookManager
-from kurd.distributed_tracing import TracingContext, extract_context, inject_context
+from kurd.distributed_tracing import TracingContext, extract_context
 from kurd.distributed_state import DistributedStateManager
 
 
@@ -140,60 +172,59 @@ class Router:
 
     def configure_runtime(
         self,
-        *,
-        global_concurrency: int = 512,
-        upstream_concurrency: int = 64,
-        python_concurrency: int = 64,
-        request_logging: bool = False,
-        rate_limiting_enabled: bool = False,
-        rate_limit_per_ip_rps: int = 1000,
-        rate_limit_global_rps: int = 10000,
-        enable_dlq: bool = False,
-        enable_idempotency: bool = False,
-        secrets_backend: str = "env",
-        dlq_storage_path: str = None,
-        idempotency_storage_path: str = None,
-        enable_webhooks: bool = False,
-        enable_distributed_state: bool = False,
-        distributed_state_backend: str = "memory",
-        redis_url: str = "redis://localhost:6379/0",
-        enable_distributed_tracing: bool = False,
+        config: RuntimeConfig | None = None,
+        **kwargs,
     ) -> None:
-        """Configure runtime with all production features."""
+        """Configure runtime. Pass a RuntimeConfig object or keyword arguments."""
+        if config is None:
+            config = RuntimeConfig(**kwargs)
+
         set_runtime_limits(
-            global_concurrency,
-            upstream_concurrency,
-            python_concurrency,
+            config.global_concurrency,
+            config.upstream_concurrency,
+            config.python_concurrency,
         )
-        set_request_logging(request_logging)
+        set_request_logging(config.request_logging)
         set_rate_limiting(
-            rate_limiting_enabled,
-            rate_limit_per_ip_rps,
-            rate_limit_global_rps,
+            config.rate_limiting_enabled,
+            config.rate_limit_per_ip_rps,
+            config.rate_limit_global_rps,
         )
+        set_tools_cache_ttl_ms(config.tools_cache_ttl_ms)
+        _rust_set_upstream_timeout_ms(config.upstream_timeout_ms)
 
-        if enable_dlq:
-            self.dlq = DeadLetterQueue(storage_path=dlq_storage_path)
-
-        if enable_idempotency:
-            self.idempotency = IdempotencyManager(storage_path=idempotency_storage_path)
-
-        if secrets_backend != "env":
-            self.secrets = SecretsManager(backend=secrets_backend)
+        if config.ip_allowlist is not None:
+            _rust_set_ip_allowlist([str(ip) for ip in config.ip_allowlist])
         else:
-            self.secrets = SecretsManager(backend="env")
+            _rust_clear_ip_allowlist()
 
-        if enable_webhooks:
+        if config.enable_dlq:
+            self.dlq = DeadLetterQueue(storage_path=config.dlq_storage_path)
+
+        if config.enable_idempotency:
+            self.idempotency = IdempotencyManager(storage_path=config.idempotency_storage_path)
+
+        self.secrets = SecretsManager(backend=config.secrets_backend)
+
+        if config.enable_webhooks:
             self.webhooks = WebhookManager()
 
-        if enable_distributed_state:
+        if config.enable_distributed_state:
             self.distributed_state = DistributedStateManager(
-                backend=distributed_state_backend,
-                redis_url=redis_url if distributed_state_backend == "redis" else None,
+                backend=config.distributed_state_backend,
+                redis_url=config.redis_url if config.distributed_state_backend == "redis" else None,
             )
 
-        if enable_distributed_tracing:
+        if config.enable_distributed_tracing:
             self.current_trace = TracingContext()
+
+    def list_upstreams(self) -> list[tuple[str, str]]:
+        """Return [(name, url)] for every registered upstream."""
+        return _rust_list_upstreams()
+
+    def list_tools(self) -> list[str]:
+        """Return names of all locally registered tools."""
+        return _rust_list_tools()
 
     def get_dlq(self) -> DeadLetterQueue:
         """Get DLQ manager instance."""
@@ -238,31 +269,7 @@ class Router:
 
     def runtime_status(self) -> dict:
         """Return a lightweight snapshot of runtime/backpressure counters."""
-        (
-            global_limit,
-            upstream_limit,
-            python_limit,
-            active_requests,
-            peak_active_requests,
-            total_requests,
-            completed_requests,
-            rejected_requests,
-            python_rejections,
-            request_logging_enabled,
-        ) = runtime_status()
-
-        status = {
-            "globalConcurrencyLimit": global_limit,
-            "upstreamConcurrencyLimit": upstream_limit,
-            "pythonConcurrencyLimit": python_limit,
-            "activeRequests": active_requests,
-            "peakActiveRequests": peak_active_requests,
-            "totalRequests": total_requests,
-            "completedRequests": completed_requests,
-            "rejectedRequests": rejected_requests,
-            "pythonRejectedCalls": python_rejections,
-            "requestLoggingEnabled": request_logging_enabled,
-        }
+        status = dict(runtime_status())
 
         if self.dlq:
             status["dlq"] = self.dlq.to_json()
