@@ -20,8 +20,11 @@ The Rust data plane handles HTTP serving, JSON-RPC dispatch, tool routing, upstr
 - [CLI](#cli)
 - [Registering Tools](#registering-tools)
 - [Mounting Upstream Servers](#mounting-upstream-servers)
+- [Tool Discovery Filtering](#tool-discovery-filtering)
+- [Admin API](#admin-api)
 - [Runtime Configuration](#runtime-configuration)
 - [Security](#security)
+- [Multi-tenancy & Policy Engine](#multi-tenancy--policy-engine)
 - [Observability](#observability)
 - [MCP Protocol Compliance](#mcp-protocol-compliance)
 - [Enterprise Features](#enterprise-features)
@@ -60,7 +63,7 @@ async def add(a: int, b: int) -> int:
 start_http_gateway("0.0.0.0:9200")
 ```
 
-The gateway starts three endpoints:
+The gateway starts the following endpoints:
 
 | Path | Method | Purpose |
 |------|--------|---------|
@@ -68,6 +71,12 @@ The gateway starts three endpoints:
 | `/health` | `GET` | Liveness probe — returns `200 OK` |
 | `/status` | `GET` | Runtime, cache, upstream, and circuit-breaker snapshot |
 | `/metrics` | `GET` | Prometheus metrics |
+| `/admin/servers` | `GET` | List registered upstream servers |
+| `/admin/servers` | `POST` | Add or replace an upstream server |
+| `/admin/servers/{name}` | `DELETE` | Remove an upstream server |
+| `/admin/tools` | `GET` | List all tools (local + upstream) with source label |
+| `/admin/tools/reload` | `POST` | Expire the tool-list cache immediately |
+| `/admin/tools/namespaces` | `GET` | List upstream namespaces |
 
 Call the gateway:
 
@@ -209,6 +218,101 @@ router.refresh_tools()     # expire the tool list cache immediately
 
 ---
 
+## Tool Discovery Filtering
+
+Clients can scope a `tools/list` call with an optional `filter` parameter — without any server-side configuration needed.
+
+### Namespace filter
+
+Returns only tools belonging to a specific upstream:
+
+```json
+{
+  "jsonrpc": "2.0", "id": 1, "method": "tools/list",
+  "params": { "filter": { "namespace": "github" } }
+}
+```
+
+### Search filter
+
+Case-insensitive substring match across tool name **and** description:
+
+```json
+{
+  "jsonrpc": "2.0", "id": 1, "method": "tools/list",
+  "params": { "filter": { "search": "file" } }
+}
+```
+
+### Discovery metadata
+
+Every `tools/list` response includes a `_kurd` object:
+
+```json
+{
+  "result": {
+    "tools": [...],
+    "_kurd": { "available": 12, "returned": 3 }
+  }
+}
+```
+
+`available` is the count after tenant restrictions; `returned` is the count after the client filter. An LLM agent can use these counts to know whether to refine its query.
+
+> **Security**: client filters always run _after_ per-tenant restrictions. A tenant cannot use `search` or `namespace` to enumerate tools outside their allowlist.
+
+---
+
+## Admin API
+
+The Admin API lets operators manage the gateway at runtime without a restart. All admin endpoints accept an optional `Authorization: Bearer <token>` header.
+
+### Set a dedicated admin token
+
+```python
+router.set_admin_token("admin-secret")
+# router.clear_admin_token()  # fall back to MCP bearer token / open
+```
+
+Or via the module-level API:
+
+```python
+from kurd import set_admin_token, clear_admin_token
+set_admin_token("admin-secret")
+```
+
+### Manage upstream servers
+
+```bash
+# List
+curl http://localhost:9200/admin/servers
+
+# Add / replace
+curl -X POST http://localhost:9200/admin/servers \
+  -H 'Content-Type: application/json' \
+  -d '{"name": "github", "url": "http://github-mcp.internal:9300/mcp"}'
+
+# Remove
+curl -X DELETE http://localhost:9200/admin/servers/github
+```
+
+Response codes: `201 Created` (new), `200 OK` (replaced), `404 Not Found` (delete miss), `400 Bad Request` (invalid URL or empty name).
+
+### Inspect tools
+
+```bash
+# All tools with source label
+curl http://localhost:9200/admin/tools
+
+# Reload (expire cache)
+curl -X POST http://localhost:9200/admin/tools/reload
+
+# List upstream namespaces
+curl http://localhost:9200/admin/tools/namespaces
+```
+
+---
+
 ## Runtime Configuration
 
 All gateway tunables are collected in `RuntimeConfig`:
@@ -331,6 +435,58 @@ For internet-facing deployments, terminate TLS at a reverse proxy (nginx, Caddy,
 
 ---
 
+## Multi-tenancy & Policy Engine
+
+Kurd ships a built-in `TenantManager` that wires directly into the Rust request hot path. One call to `set_policy_engine()` activates both `tools/call` gating and `tools/list` filtering simultaneously.
+
+### Basic setup
+
+```python
+from kurd import Router, TenantManager
+
+manager = TenantManager()
+
+# Add tenants with explicit tool allowlists
+manager.add_tenant("acme",   name="Acme Corp",  allowed_tools=["add", "search"], api_key="sk-acme")
+manager.add_tenant("devops", name="DevOps Team", allowed_tools=["*"],            api_key="sk-ops")
+
+router = Router()
+router.set_policy_engine(manager)
+# router.clear_policy_engine()  # disable, all requests allowed again
+```
+
+### What it enforces
+
+| Behaviour | Details |
+|-----------|---------|
+| `tools/call` gating | Unknown API key or tool outside allowlist → `403 Forbidden` (JSON-RPC `-32004`) |
+| `tools/list` filtering | Response contains only the tools the caller may invoke |
+| Wildcard support | `"*"` in `allowed_tools` passes all tools through |
+| Namespace wildcard | `"github.*"` passes all tools prefixed `github.` |
+| Unknown key | Returns an empty `tools` list and `403` on any `tools/call` |
+
+### Calling with a tenant key
+
+```bash
+curl http://localhost:9200/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer sk-acme' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+# → returns only ["add", "search"]
+```
+
+### Prometheus metric
+
+```
+kurd_policy_denied_total   # counter — requests blocked by the policy engine
+```
+
+### Per-tenant quotas and billing
+
+For rate-per-tenant quotas, request tracking, and billing see the [Enterprise Features](#enterprise-features) section.
+
+---
+
 ## Observability
 
 ### Structured logging
@@ -359,6 +515,7 @@ curl http://localhost:9200/metrics
 | Metric | Type | Description |
 |--------|------|-------------|
 | `kurd_requests_total{status}` | counter | Total requests by status (`total`, `completed`, `rejected`) |
+| `kurd_policy_denied_total` | counter | Requests blocked by the policy engine (`-32004`) |
 | `kurd_requests_active` | gauge | In-flight requests right now |
 | `kurd_requests_peak_active` | gauge | Highest concurrent request count since startup |
 | `kurd_request_latency_ms` | gauge | Rolling average latency (ms) |
@@ -406,15 +563,46 @@ instances:
 
 ### OpenTelemetry
 
-```python
-from kurd.telemetry import setup_otel, OTELConfig
+Kurd exports real OTLP spans from the Rust core — no Python OpenTelemetry SDK required.
 
-setup_otel(OTELConfig(
-    service_name    = "my-gateway",
-    otlp_endpoint   = "http://otel-collector:4317",
-    sample_rate     = 1.0,
-))
+#### Quick setup
+
+```python
+from kurd import Router
+from kurd.telemetry import setup_otel
+
+router = Router()
+
+# Activates Rust-side OTLP export. setup_otel returns an OTELTracer for
+# any additional Python-side instrumentation you want.
+setup_otel(
+    service_name = "my-gateway",
+    endpoint     = "http://otel-collector:4318",  # OTLP HTTP receiver
+)
 ```
+
+Or directly via the Router:
+
+```python
+router.configure_otel("http://otel-collector:4318", service_name="my-gateway")
+# router.clear_otel()  # disable export
+```
+
+#### What gets traced
+
+- Every request that passes authentication, rate limiting, and concurrency checks produces one server-side span.
+- Spans are exported **fire-and-forget** (2-second timeout, errors silently dropped) so a slow or unavailable collector never adds latency.
+- The OTLP JSON payload is sent to `{endpoint}/v1/traces`.
+
+#### W3C `traceparent` propagation
+
+Every MCP response carries a `traceparent` header so downstream services and LLM agents can continue the trace:
+
+```
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+```
+
+If the incoming request already carries a `traceparent`, Kurd preserves the `trace_id` and issues a new `span_id`. Malformed headers start a fresh trace.
 
 `OTELConfig.service_version` defaults to the installed `kurd` package version automatically.
 
@@ -449,8 +637,8 @@ Kurd implements the MCP **2026-07-28** protocol revision.
 | `initialize` | Returns `protocolVersion`, `capabilities`, and `serverInfo` |
 | `ping` | Returns `{}` |
 | `server/discover` | Returns capabilities, supported versions, and server identity |
-| `tools/list` | Aggregates local + upstream tools; supports cursor-based pagination |
-| `tools/call` | Routes to local Python tool or upstream server |
+| `tools/list` | Aggregates local + upstream tools; cursor-based pagination; `params.filter.namespace` / `params.filter.search`; `_kurd` metadata; per-tenant filtering when policy engine is active |
+| `tools/call` | Routes to local Python tool or upstream server; policy engine gate when active |
 | `resources/list` | Returns empty list with `ttlMs` and `cacheScope` |
 | `resources/read` | Returns `{"contents": []}` |
 | `prompts/list` | Returns empty list with `ttlMs` and `cacheScope` |
@@ -476,15 +664,18 @@ Enable features through `RuntimeConfig` or by importing the relevant manager cla
 
 ### Multi-tenancy
 
+See [Multi-tenancy & Policy Engine](#multi-tenancy--policy-engine) above for the full policy engine and tool-filtering setup.
+
 ```python
-from kurd.multitenancy import TenantManager
+from kurd import TenantManager
 
 manager = TenantManager()
-api_key = manager.add_tenant(
+manager.add_tenant(
     tenant_id="acme",
     name="Acme Corp",
     quota_rps=100,
     allowed_tools=["add", "search"],
+    api_key="sk-acme",
 )
 ```
 
@@ -627,9 +818,12 @@ Python application
        ▼
   kurd.Router                      ← Python API layer
        │
+       ├── Policy engine (set_policy_engine)
+       │   TenantManager callbacks wired into Rust hot path
+       │
        ├── Enterprise modules (optional, lazy)
        │   multitenancy · billing · idempotency · DLQ
-       │   secrets · webhooks · distributed state · tracing
+       │   secrets · webhooks · distributed state
        │
        ▼
    PyO3 boundary
@@ -640,13 +834,17 @@ Python application
        ├── HTTP handler  ─────────────────────────────────┐
        │   content-type · auth · IP allowlist              │
        │   rate limiting · concurrency backpressure        │
-       │   CORS · request ID · tracing                     │
+       │   CORS · request ID · W3C traceparent             │
+       │   OTLP span export (fire-and-forget)              │
+       │                                                   │
+       ├── Admin API (/admin/*)                            │
+       │   server CRUD · tool listing · cache reload       │
        │                                                   │
        ├── MCP dispatcher                                  │
        │   initialize · ping · server/discover             │
-       │   tools/list (paginated) · tools/call             │
-       │   resources · prompts · completion · logging      │
-       │   notifications (202)                             │
+       │   tools/list (paginated, filtered, _kurd meta)    │
+       │   tools/call (policy gate) · resources · prompts  │
+       │   completion · logging · notifications (202)      │
        │                                                   │
        ├── Local Python tools ◄── PyO3 callback            │
        │   (Rayon-parallel batch parsing)                  │
@@ -706,6 +904,11 @@ The test suite covers:
 - Request-size and content-type guards
 - Prometheus metrics output
 - Load and burst behaviour
+- **Policy engine**: allow, deny, unknown key, clear (P0)
+- **Admin API**: server CRUD, tool listing, reload, auth token (P1)
+- **Per-tenant tool filtering**: wildcard, restricted, unknown key, clear (P2)
+- **Client tool discovery**: namespace filter, search, combined, `_kurd` metadata, bypass prevention (P3)
+- **OpenTelemetry**: `traceparent` presence/format, trace-id propagation, span-id rotation, malformed input, enable/disable (P4)
 
 ### Linting
 
@@ -746,14 +949,18 @@ kurd-mcp/
 │   ├── distributed_tracing.py
 │   └── ...
 ├── src/
-│   └── lib.rs                 # Rust data plane (~2600 lines)
+│   └── lib.rs                      # Rust data plane (~3500 lines)
 ├── tests/
 │   ├── test_core.py
-│   ├── test_http_gateway.py   # Integration tests (module-scoped gateway)
+│   ├── test_http_gateway.py        # Integration tests (module-scoped gateway)
+│   ├── test_admin_api.py           # P1 — Admin HTTP API
+│   ├── test_tool_filtering.py      # P2 — Per-tenant tools/list filtering
+│   ├── test_tool_discovery.py      # P3 — Client-requested filter + _kurd metadata
+│   ├── test_otel.py                # P4 — traceparent / OTLP export
 │   ├── test_upstream.py
 │   ├── test_load.py
 │   ├── test_prometheus_metrics.py
-│   └── upstream_server.py     # In-process upstream fixture
+│   └── upstream_server.py          # In-process upstream fixture
 ├── Cargo.toml
 ├── pyproject.toml
 ├── LICENSE
