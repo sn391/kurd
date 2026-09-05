@@ -107,6 +107,11 @@ def setup_otel(
     """
     Setup OpenTelemetry.
 
+    When an ``endpoint`` is provided the Rust gateway core is configured to
+    export real OTLP spans fire-and-forget to ``{endpoint}/v1/traces``.  A
+    W3C ``traceparent`` header is added to every MCP response so downstream
+    services can continue the trace.
+
     Args:
         service_name: Name of the service
         service_version: Version of the service
@@ -133,7 +138,14 @@ def setup_otel(
         api_key=api_key,
         environment=environment,
     )
-    return OTELTracer(config)
+    tracer = OTELTracer(config)
+    if endpoint:
+        try:
+            from kurd._kurd import configure_otel as _rust_configure_otel
+            _rust_configure_otel(endpoint, service_name)
+        except Exception:
+            pass
+    return tracer
 
 
 # Exporter implementations

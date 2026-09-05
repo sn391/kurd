@@ -23,6 +23,14 @@ from kurd._kurd import (
     list_tools as _rust_list_tools,
     set_ip_allowlist as _rust_set_ip_allowlist,
     clear_ip_allowlist as _rust_clear_ip_allowlist,
+    set_policy_callback as _rust_set_policy_callback,
+    clear_policy_callback as _rust_clear_policy_callback,
+    set_tool_filter_callback as _rust_set_tool_filter_callback,
+    clear_tool_filter_callback as _rust_clear_tool_filter_callback,
+    set_admin_token as _rust_set_admin_token,
+    clear_admin_token as _rust_clear_admin_token,
+    configure_otel as _rust_configure_otel,
+    clear_otel as _rust_clear_otel,
 )
 
 
@@ -169,6 +177,60 @@ class Router:
         del self._tools[name]
         _rust_unregister_tool(name)
         return True
+
+    def set_policy_engine(self, manager) -> None:
+        """Wire a TenantManager into the request path.
+
+        Two callbacks are registered:
+        - tools/call is gated by manager.validate_request(api_key, tool_name).
+          Tenants with no matching API key or insufficient permissions receive
+          a -32004 Forbidden response.
+        - tools/list is filtered so tenants only see tools they are allowed to
+          call. Wildcards ("*", "upstream.*") are supported in allowed_tools.
+        """
+        _rust_set_policy_callback(manager.validate_request)
+
+        def _tool_filter(api_key: str):
+            tenant = manager.get_tenant_by_api_key(api_key)
+            if tenant is None:
+                return []  # unknown key sees nothing
+            if "*" in tenant.allowed_tools:
+                return None  # wildcard: all tools visible
+            return list(tenant.allowed_tools)
+
+        _rust_set_tool_filter_callback(_tool_filter)
+
+    def clear_policy_engine(self) -> None:
+        """Remove the policy engine — all tools/calls are allowed (default behaviour)."""
+        _rust_clear_policy_callback()
+        _rust_clear_tool_filter_callback()
+
+    def set_admin_token(self, token: str) -> None:
+        """Set a dedicated bearer token for the /admin/* endpoints.
+
+        If set, admin endpoints require this token (separate from the MCP bearer token).
+        If not set, admin endpoints fall back to the MCP bearer token; if neither is
+        configured they are open (dev mode).
+        """
+        _rust_set_admin_token(token)
+
+    def clear_admin_token(self) -> None:
+        """Remove the dedicated admin token (admin endpoints fall back to bearer token)."""
+        _rust_clear_admin_token()
+
+    def configure_otel(self, endpoint: str, service_name: str = "kurd") -> None:
+        """Enable real OTLP trace export.
+
+        Spans are emitted for every MCP request and POSTed fire-and-forget to
+        ``{endpoint}/v1/traces`` in OTLP JSON format.  The gateway injects a
+        W3C ``traceparent`` response header on every request so downstream
+        services can continue the trace.
+        """
+        _rust_configure_otel(endpoint, service_name)
+
+    def clear_otel(self) -> None:
+        """Disable OTLP export (spans are no longer sent to the collector)."""
+        _rust_clear_otel()
 
     def configure_runtime(
         self,

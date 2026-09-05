@@ -5,11 +5,12 @@ try:
 except Exception:
     __version__ = "0.0.0"
 
-from ._kurd import fast_parse, fast_parse_batch, set_ip_allowlist, clear_ip_allowlist
+from ._kurd import fast_parse, fast_parse_batch, set_ip_allowlist, clear_ip_allowlist, set_admin_token, clear_admin_token, configure_otel, clear_otel
 from .router import Router, RuntimeConfig
 from .telemetry import setup_otel, OTELTracer, OTELConfig
 from .authorization import AuthorizationManager, Role, Permission
 from .health_checks import HealthCheckManager
+from .multitenancy import TenantManager, Tenant
 
 __all__ = [
     "__version__",
@@ -26,4 +27,10 @@ __all__ = [
     "Role",
     "Permission",
     "HealthCheckManager",
+    "TenantManager",
+    "Tenant",
+    "set_admin_token",
+    "clear_admin_token",
+    "configure_otel",
+    "clear_otel",
 ]

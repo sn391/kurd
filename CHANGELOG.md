@@ -4,6 +4,24 @@ All notable changes to Kurd are documented in this file.
 
 The format is based on Keep a Changelog, and the project follows Semantic Versioning.
 
+## [0.7.0] - 2026-09-06
+
+### Added
+
+- **Policy engine (P0)** — per-tenant request gating via a Python `TenantManager.validate_request` callback wired directly into the `tools/call` hot path. Forbidden requests return a JSON-RPC `-32004` error. Denials are counted in the Prometheus `kurd_policy_denied_total` metric.
+- **Admin HTTP API (P1)** — `GET/POST /admin/servers`, `DELETE /admin/servers/{name}`, `GET /admin/tools`, `POST /admin/tools/reload`, `GET /admin/tools/namespaces`. A dedicated admin bearer token can be set via `Router.set_admin_token()`.
+- **Multi-tenant tool filtering (P2)** — `tools/list` returns only the tools a tenant is allowed to call, based on their API key and `allowed_tools` allowlist (supports wildcards). Unknown keys see an empty list.
+- **Client-requested tool discovery (P3)** — `params.filter.namespace` scopes results to an upstream; `params.filter.search` performs case-insensitive substring matching on tool name and description. Both filters run after tenant restrictions so tenants cannot enumerate tools outside their allowlist. `_kurd.available` / `_kurd.returned` metadata counts are included in every `tools/list` response.
+- **Real OTLP trace export (P4)** — every MCP request emits a W3C-compliant `traceparent` response header. When `Router.configure_otel(endpoint, service_name)` is called, spans are exported fire-and-forget to `{endpoint}/v1/traces` in OTLP JSON format using the existing connection-pooled HTTP client. `setup_otel()` in `kurd.telemetry` now wires into Rust automatically when an endpoint is provided.
+
+### Changed
+
+- `kurd.telemetry.setup_otel()` now activates real Rust-side OTLP export when `endpoint` is set, replacing the previous in-memory stub.
+
+### Validation
+
+- 78 tests passing across 5 test modules (gateway, admin API, tool filtering, tool discovery, OTEL).
+
 ## [0.3.0] - 2026-08-20
 
 ### Added

@@ -1,17 +1,18 @@
 use pyo3::prelude::*;
 use rayon::prelude::*;
+use serde::Deserialize;
 use serde_json::Value;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::net::{IpAddr, SocketAddr};
 use axum::extract::ConnectInfo;
 use rand::Rng;
 use std::collections::HashMap;
 use axum::{
     body::Bytes,
-    extract::DefaultBodyLimit,
+    extract::{DefaultBodyLimit, Json, Path},
     http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Router as AxumRouter,
 };
 use tokio::sync::oneshot;
@@ -51,6 +52,9 @@ static HTTP_SERVER_CONTROL: Lazy<Mutex<Option<HttpServerControl>>> =
 
 
 static HTTP_BEARER_TOKEN: Lazy<RwLock<Option<String>>> =
+    Lazy::new(|| RwLock::new(None));
+
+static ADMIN_TOKEN: Lazy<RwLock<Option<String>>> =
     Lazy::new(|| RwLock::new(None));
 
 static ALLOW_PRIVATE_UPSTREAMS: AtomicBool = AtomicBool::new(true);
@@ -149,8 +153,231 @@ fn clear_ip_allowlist() -> PyResult<()> {
     }
 }
 
+#[pyfunction]
+fn set_policy_callback(callback: Py<PyAny>) -> PyResult<()> {
+    match POLICY_CALLBACK.write() {
+        Ok(mut guard) => {
+            *guard = Some(callback);
+            Ok(())
+        }
+        Err(_) => Err(pyo3::exceptions::PyRuntimeError::new_err("Policy callback lock poisoned")),
+    }
+}
+
+#[pyfunction]
+fn clear_policy_callback() -> PyResult<()> {
+    match POLICY_CALLBACK.write() {
+        Ok(mut guard) => {
+            *guard = None;
+            Ok(())
+        }
+        Err(_) => Err(pyo3::exceptions::PyRuntimeError::new_err("Policy callback lock poisoned")),
+    }
+}
+
+fn extract_bearer_token(headers: &HeaderMap) -> String {
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("")
+        .to_string()
+}
+
+// Returns None = allowed, Some(reason) = denied.
+// Calls the Python policy callback synchronously — must run on spawn_blocking.
+fn check_policy_sync(api_key: String, tool_name: String) -> Option<String> {
+    Python::attach(|py| -> Option<String> {
+        let guard = POLICY_CALLBACK.read().ok()?;
+        let callback = guard.as_ref()?;
+        let result = callback.call1(py, (&api_key, &tool_name)).ok()?;
+        let tuple = result.bind(py);
+        let allowed: bool = tuple.get_item(0).ok()?.extract().ok()?;
+        if allowed {
+            None
+        } else {
+            let reason: Option<String> = tuple.get_item(1).ok()?.extract().ok().flatten();
+            Some(reason.unwrap_or_else(|| "Forbidden by policy".to_string()))
+        }
+    })
+}
+
+#[pyfunction]
+fn set_tool_filter_callback(callback: Py<PyAny>) -> PyResult<()> {
+    match TOOL_FILTER_CALLBACK.write() {
+        Ok(mut guard) => { *guard = Some(callback); Ok(()) }
+        Err(_) => Err(pyo3::exceptions::PyRuntimeError::new_err("Tool filter callback lock poisoned")),
+    }
+}
+
+#[pyfunction]
+fn clear_tool_filter_callback() -> PyResult<()> {
+    match TOOL_FILTER_CALLBACK.write() {
+        Ok(mut guard) => { *guard = None; Ok(()) }
+        Err(_) => Err(pyo3::exceptions::PyRuntimeError::new_err("Tool filter callback lock poisoned")),
+    }
+}
+
+// Returns None = show all tools, Some(patterns) = restrict to matching tools.
+// Must run on spawn_blocking.
+fn get_tenant_tool_filter(api_key: String) -> Option<Vec<String>> {
+    Python::attach(|py| -> Option<Vec<String>> {
+        let guard = TOOL_FILTER_CALLBACK.read().ok()?;
+        let callback = guard.as_ref()?;
+        let result = callback.call1(py, (&api_key,)).ok()?;
+        let bound = result.bind(py);
+        if bound.is_none() {
+            return None;
+        }
+        let patterns: Vec<String> = bound.extract().ok()?;
+        // Wildcard means "all tools" — same as no filter.
+        if patterns.iter().any(|p| p == "*") {
+            return None;
+        }
+        Some(patterns)
+    })
+}
+
+// Checks whether a tool name matches any pattern in the filter list.
+// Supported patterns: exact ("add"), namespace wildcard ("github.*"), global ("*").
+fn tool_name_matches_filter(name: &str, patterns: &[String]) -> bool {
+    patterns.iter().any(|p| {
+        if p == "*" {
+            return true;
+        }
+        if let Some(prefix) = p.strip_suffix(".*") {
+            return name.starts_with(&format!("{prefix}.")) || name == prefix;
+        }
+        name == p.as_str()
+    })
+}
+
+fn generate_hex_id(bytes: usize) -> String {
+    use rand::Rng as _;
+    let mut rng = rand::rng();
+    (0..bytes).map(|_| format!("{:02x}", rng.random::<u8>())).collect()
+}
+
+fn parse_traceparent(header: &str) -> Option<(String, String)> {
+    let parts: Vec<&str> = header.splitn(4, '-').collect();
+    if parts.len() != 4 { return None; }
+    let trace_id = parts[1];
+    let parent_id = parts[2];
+    if trace_id.len() == 32 && parent_id.len() == 16 {
+        Some((trace_id.to_string(), parent_id.to_string()))
+    } else {
+        None
+    }
+}
+
+async fn export_otel_span(
+    trace_id: String,
+    span_id: String,
+    parent_span_id: Option<String>,
+    operation: String,
+    start_ns: u64,
+    end_ns: u64,
+    status_code: u16,
+) {
+    if !OTEL_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let endpoint = {
+        let guard = match OTEL_ENDPOINT.read() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        match guard.as_deref() {
+            Some(ep) => ep.to_string(),
+            None => return,
+        }
+    };
+    let service_name = OTEL_SERVICE_NAME.read()
+        .map(|g| g.clone())
+        .unwrap_or_else(|_| "kurd".to_string());
+
+    let otel_status = if status_code < 400 { 1i64 } else { 2i64 };
+    let mut span = serde_json::json!({
+        "traceId": trace_id,
+        "spanId": span_id,
+        "name": operation,
+        "kind": 2,
+        "startTimeUnixNano": start_ns.to_string(),
+        "endTimeUnixNano": end_ns.to_string(),
+        "attributes": [
+            {"key": "http.status_code", "value": {"intValue": status_code as i64}}
+        ],
+        "status": {"code": otel_status}
+    });
+    if let Some(pid) = parent_span_id {
+        if !pid.is_empty() {
+            span["parentSpanId"] = serde_json::json!(pid);
+        }
+    }
+    let payload = serde_json::json!({
+        "resourceSpans": [{
+            "resource": {
+                "attributes": [
+                    {"key": "service.name", "value": {"stringValue": service_name}},
+                    {"key": "telemetry.sdk.name", "value": {"stringValue": "kurd-rust"}}
+                ]
+            },
+            "scopeSpans": [{
+                "scope": {"name": "kurd"},
+                "spans": [span]
+            }]
+        }]
+    });
+    let url = format!("{}/v1/traces", endpoint);
+    let _ = HTTP_CLIENT
+        .post(&url)
+        .header("content-type", "application/json")
+        .body(payload.to_string())
+        .timeout(Duration::from_millis(2000))
+        .send()
+        .await;
+}
+
+#[pyfunction]
+fn configure_otel(endpoint: String, service_name: String) -> PyResult<()> {
+    match OTEL_ENDPOINT.write() {
+        Ok(mut g) => { *g = Some(endpoint); }
+        Err(_) => return Err(pyo3::exceptions::PyRuntimeError::new_err("OTEL lock poisoned")),
+    }
+    match OTEL_SERVICE_NAME.write() {
+        Ok(mut g) => { *g = service_name; }
+        Err(_) => return Err(pyo3::exceptions::PyRuntimeError::new_err("OTEL lock poisoned")),
+    }
+    OTEL_ENABLED.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+#[pyfunction]
+fn clear_otel() -> PyResult<()> {
+    OTEL_ENABLED.store(false, Ordering::Relaxed);
+    if let Ok(mut g) = OTEL_ENDPOINT.write() {
+        *g = None;
+    }
+    Ok(())
+}
+
 const OVERLOAD_ERROR_CODE: i64 = -32029;
 const RATE_LIMIT_ERROR_CODE: i64 = -32028;
+const POLICY_DENIED_ERROR_CODE: i64 = -32004;
+
+static POLICY_DENIED_REQUESTS: AtomicU64 = AtomicU64::new(0);
+
+static POLICY_CALLBACK: Lazy<RwLock<Option<Py<PyAny>>>> =
+    Lazy::new(|| RwLock::new(None));
+
+// Called on tools/list: (api_key: str) -> Optional[List[str]]
+// None = show all tools; a list = show only tools matching those patterns.
+static TOOL_FILTER_CALLBACK: Lazy<RwLock<Option<Py<PyAny>>>> =
+    Lazy::new(|| RwLock::new(None));
+
+static OTEL_ENABLED: AtomicBool = AtomicBool::new(false);
+static OTEL_ENDPOINT: Lazy<RwLock<Option<String>>> = Lazy::new(|| RwLock::new(None));
+static OTEL_SERVICE_NAME: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new("kurd".to_string()));
 
 struct AtomicPermit {
     counter: &'static AtomicU64,
@@ -1134,6 +1361,47 @@ fn clear_http_bearer_token() -> PyResult<()> {
 }
 
 #[pyfunction]
+fn set_admin_token(token: String) -> PyResult<()> {
+    match ADMIN_TOKEN.write() {
+        Ok(mut guard) => { *guard = Some(token); Ok(()) }
+        Err(_) => Err(pyo3::exceptions::PyRuntimeError::new_err("Admin token lock poisoned")),
+    }
+}
+
+#[pyfunction]
+fn clear_admin_token() -> PyResult<()> {
+    match ADMIN_TOKEN.write() {
+        Ok(mut guard) => { *guard = None; Ok(()) }
+        Err(_) => Err(pyo3::exceptions::PyRuntimeError::new_err("Admin token lock poisoned")),
+    }
+}
+
+// Returns true if the request carries a valid admin credential.
+// Priority: dedicated admin token → fallback to bearer token → open if neither configured.
+fn authorize_admin_request(headers: &HeaderMap) -> bool {
+    let provided = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+
+    if let Ok(guard) = ADMIN_TOKEN.read() {
+        if let Some(ref expected) = *guard {
+            return constant_time_eq(provided, expected);
+        }
+    }
+
+    // No dedicated admin token — fall back to the regular bearer token.
+    if let Ok(guard) = HTTP_BEARER_TOKEN.read() {
+        if let Some(ref expected) = *guard {
+            return constant_time_eq(provided, expected);
+        }
+    }
+
+    true // neither token configured → dev/open mode
+}
+
+#[pyfunction]
 fn set_allow_private_upstreams(allow: bool) -> PyResult<()> {
     ALLOW_PRIVATE_UPSTREAMS.store(allow, Ordering::Relaxed);
     Ok(())
@@ -1396,12 +1664,189 @@ async fn mcp_options() -> impl IntoResponse {
     )
 }
 
+// ---------------------------------------------------------
+// Admin API handlers
+// ---------------------------------------------------------
+
+#[derive(Deserialize)]
+struct AddServerRequest {
+    name: String,
+    url: String,
+}
+
+async fn admin_list_servers(headers: HeaderMap) -> impl IntoResponse {
+    if !authorize_admin_request(&headers) {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "Unauthorized"}))).into_response();
+    }
+
+    let upstreams: Vec<(String, String)> = UPSTREAM_REGISTRY
+        .read()
+        .map(|r| r.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        .unwrap_or_default();
+
+    let metrics = UPSTREAM_METRICS.read().ok();
+    let breakers = CIRCUIT_BREAKERS.read().ok();
+
+    let servers: Vec<Value> = upstreams.iter().map(|(name, url)| {
+        let m = metrics.as_ref().and_then(|m| m.get(name));
+        let b = breakers.as_ref().and_then(|b| b.get(name));
+
+        let circuit_state = match b {
+            Some(s) if s.opened_at.map_or(false, |t| t.elapsed() < CIRCUIT_RESET_TIMEOUT) => "open",
+            _ => "closed",
+        };
+
+        serde_json::json!({
+            "name": name,
+            "url": url,
+            "circuitBreaker": circuit_state,
+            "metrics": {
+                "requests": m.map_or(0, |x| x.requests),
+                "successes": m.map_or(0, |x| x.successes),
+                "failures": m.map_or(0, |x| x.failures),
+                "retries": m.map_or(0, |x| x.retries),
+                "avgLatencyMs": m.map_or(0.0, |x| {
+                    if x.successes > 0 { x.total_latency_ms as f64 / x.successes as f64 } else { 0.0 }
+                }),
+                "lastLatencyMs": m.map_or(0, |x| x.last_latency_ms)
+            }
+        })
+    }).collect();
+
+    (StatusCode::OK, Json(serde_json::json!({"servers": servers, "count": servers.len()}))).into_response()
+}
+
+async fn admin_add_server(headers: HeaderMap, Json(body): Json<AddServerRequest>) -> impl IntoResponse {
+    if !authorize_admin_request(&headers) {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "Unauthorized"}))).into_response();
+    }
+
+    if body.name.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "name is required"}))).into_response();
+    }
+
+    if let Err(e) = validate_upstream_url(&body.url) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))).into_response();
+    }
+
+    match UPSTREAM_REGISTRY.write() {
+        Ok(mut registry) => {
+            let replaced = registry.contains_key(&body.name);
+            registry.insert(body.name.clone(), body.url.clone());
+            if let Ok(mut cache) = TOOLS_CACHE.write() { *cache = None; }
+            if let Ok(mut metrics) = TOOLS_CACHE_METRICS.write() { metrics.invalidations += 1; }
+            let status = if replaced { StatusCode::OK } else { StatusCode::CREATED };
+            (status, Json(serde_json::json!({"name": body.name, "url": body.url, "replaced": replaced}))).into_response()
+        }
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Registry lock poisoned"}))).into_response(),
+    }
+}
+
+async fn admin_delete_server(headers: HeaderMap, Path(name): Path<String>) -> impl IntoResponse {
+    if !authorize_admin_request(&headers) {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "Unauthorized"}))).into_response();
+    }
+
+    match UPSTREAM_REGISTRY.write() {
+        Ok(mut registry) => {
+            if registry.remove(&name).is_some() {
+                if let Ok(mut cache) = TOOLS_CACHE.write() { *cache = None; }
+                if let Ok(mut metrics) = TOOLS_CACHE_METRICS.write() { metrics.invalidations += 1; }
+                (StatusCode::OK, Json(serde_json::json!({"deleted": name}))).into_response()
+            } else {
+                (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": format!("Server not found: {name}")}))).into_response()
+            }
+        }
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Registry lock poisoned"}))).into_response(),
+    }
+}
+
+async fn admin_list_tools(headers: HeaderMap) -> impl IntoResponse {
+    if !authorize_admin_request(&headers) {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "Unauthorized"}))).into_response();
+    }
+
+    let upstream_tools = list_upstream_tools().await;
+
+    let local_tools: Vec<Value> = TOOL_REGISTRY.read().map(|r| {
+        r.iter().map(|(name, t)| serde_json::json!({
+            "name": name,
+            "description": t.description,
+            "source": "local",
+            "inputSchema": t.input_schema
+        })).collect()
+    }).unwrap_or_default();
+
+    let upstream_annotated: Vec<Value> = upstream_tools.into_iter().map(|mut t| {
+        let source = t.get("name")
+            .and_then(|n| n.as_str())
+            .and_then(|n| n.split_once('.'))
+            .map(|(upstream, _)| upstream.to_string())
+            .unwrap_or_else(|| "upstream".to_string());
+        if let Some(obj) = t.as_object_mut() {
+            obj.insert("source".to_string(), Value::String(source));
+        }
+        t
+    }).collect();
+
+    let local_count = local_tools.len();
+    let upstream_count = upstream_annotated.len();
+    let mut all_tools = local_tools;
+    all_tools.extend(upstream_annotated);
+    let total = all_tools.len();
+    (StatusCode::OK, Json(serde_json::json!({
+        "tools": all_tools,
+        "count": total,
+        "localCount": local_count,
+        "upstreamCount": upstream_count
+    }))).into_response()
+}
+
+async fn admin_reload_tools(headers: HeaderMap) -> impl IntoResponse {
+    if !authorize_admin_request(&headers) {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "Unauthorized"}))).into_response();
+    }
+
+    if let Ok(mut cache) = TOOLS_CACHE.write() { *cache = None; }
+    if let Ok(mut metrics) = TOOLS_CACHE_METRICS.write() { metrics.invalidations += 1; }
+
+    (StatusCode::OK, Json(serde_json::json!({"reloaded": true}))).into_response()
+}
+
+async fn admin_list_namespaces(headers: HeaderMap) -> impl IntoResponse {
+    if !authorize_admin_request(&headers) {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "Unauthorized"}))).into_response();
+    }
+
+    let upstream_namespaces: Vec<Value> = UPSTREAM_REGISTRY
+        .read()
+        .map(|r| r.keys().map(|k| serde_json::json!({"namespace": k, "source": "upstream"})).collect())
+        .unwrap_or_default();
+
+    let has_local = TOOL_REGISTRY
+        .read()
+        .map(|r| !r.is_empty())
+        .unwrap_or(false);
+
+    let mut namespaces = upstream_namespaces;
+    if has_local {
+        namespaces.push(serde_json::json!({"namespace": "local", "source": "local"}));
+    }
+
+    (StatusCode::OK, Json(serde_json::json!({"namespaces": namespaces, "count": namespaces.len()}))).into_response()
+}
+
 fn build_http_router() -> AxumRouter {
     AxumRouter::new()
         .route("/health", get(health))
         .route("/status", get(status))
         .route("/metrics", get(metrics_prometheus))
         .route("/mcp", post(mcp_root).options(mcp_options))
+        .route("/admin/servers", get(admin_list_servers).post(admin_add_server))
+        .route("/admin/servers/{name}", delete(admin_delete_server))
+        .route("/admin/tools", get(admin_list_tools))
+        .route("/admin/tools/reload", post(admin_reload_tools))
+        .route("/admin/tools/namespaces", get(admin_list_namespaces))
         .layer(DefaultBodyLimit::max(MAX_MCP_BODY_BYTES))
 }
 
@@ -1599,6 +2044,14 @@ fn _kurd(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(runtime_status, m)?)?;
     m.add_function(wrap_pyfunction!(set_ip_allowlist, m)?)?;
     m.add_function(wrap_pyfunction!(clear_ip_allowlist, m)?)?;
+    m.add_function(wrap_pyfunction!(set_policy_callback, m)?)?;
+    m.add_function(wrap_pyfunction!(clear_policy_callback, m)?)?;
+    m.add_function(wrap_pyfunction!(set_tool_filter_callback, m)?)?;
+    m.add_function(wrap_pyfunction!(clear_tool_filter_callback, m)?)?;
+    m.add_function(wrap_pyfunction!(set_admin_token, m)?)?;
+    m.add_function(wrap_pyfunction!(clear_admin_token, m)?)?;
+    m.add_function(wrap_pyfunction!(configure_otel, m)?)?;
+    m.add_function(wrap_pyfunction!(clear_otel, m)?)?;
 
     Ok(())
 }
@@ -1622,9 +2075,15 @@ async fn metrics_prometheus() -> impl IntoResponse {
     let active_requests = GLOBAL_ACTIVE_REQUESTS.load(Ordering::Acquire);
     let peak_active_requests = GLOBAL_PEAK_ACTIVE_REQUESTS.load(Ordering::Acquire);
 
+    let policy_denied = POLICY_DENIED_REQUESTS.load(Ordering::Acquire);
+
     output.push_str(&format!("kurd_requests_total {{status=\"total\"}} {}\n", total_requests));
     output.push_str(&format!("kurd_requests_total {{status=\"completed\"}} {}\n", completed_requests));
     output.push_str(&format!("kurd_requests_total {{status=\"rejected\"}} {}\n", rejected_requests));
+
+    output.push_str("# HELP kurd_policy_denied_total Requests denied by the policy engine\n");
+    output.push_str("# TYPE kurd_policy_denied_total counter\n");
+    output.push_str(&format!("kurd_policy_denied_total {}\n", policy_denied));
 
     output.push_str("# HELP kurd_requests_active Active HTTP requests\n");
     output.push_str("# TYPE kurd_requests_active gauge\n");
@@ -1996,6 +2455,8 @@ async fn status() -> impl IntoResponse {
         },
         "security": {
             "authEnabled": auth_enabled,
+            "policyEnabled": POLICY_CALLBACK.read().map(|g| g.is_some()).unwrap_or(false),
+            "policyDeniedRequests": POLICY_DENIED_REQUESTS.load(Ordering::Acquire),
             "maxMcpBodyBytes": MAX_MCP_BODY_BYTES,
             "allowPrivateUpstreams": ALLOW_PRIVATE_UPSTREAMS.load(Ordering::Relaxed),
             "upstreamTimeoutMs": UPSTREAM_TIMEOUT_MS.load(Ordering::Relaxed)
@@ -2243,7 +2704,31 @@ async fn mcp_root(
         }
     };
 
+    let otel_start_ns = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+    let (otel_trace_id, otel_parent_span_id) = headers.get("traceparent")
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_traceparent)
+        .map(|(tid, pid)| (tid, Some(pid)))
+        .unwrap_or_else(|| (generate_hex_id(16), None));
+    let otel_span_id = generate_hex_id(8);
+
     let mut response = mcp_root_inner(headers, body, pre_parsed).await.into_response();
+
+    let otel_end_ns = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
+    let otel_status_code = response.status().as_u16();
+    let otel_op = method.as_deref().unwrap_or("mcp.request").to_string();
+    {
+        let tid = otel_trace_id.clone();
+        let sid = otel_span_id.clone();
+        let pid = otel_parent_span_id.clone();
+        tokio::spawn(async move {
+            export_otel_span(tid, sid, pid, otel_op, otel_start_ns, otel_end_ns, otel_status_code).await;
+        });
+    }
+    let new_traceparent = format!("00-{otel_trace_id}-{otel_span_id}-01");
+    if let Ok(tp_value) = HeaderValue::from_str(&new_traceparent) {
+        response.headers_mut().insert("traceparent", tp_value);
+    }
 
     if let Ok(value) = HeaderValue::from_str(&request_id) {
         response.headers_mut().insert("x-request-id", value);
@@ -2537,6 +3022,66 @@ async fn mcp_root_inner(headers: HeaderMap, body: Bytes, pre_parsed: Option<Valu
             left_name.cmp(right_name)
         });
 
+        // Per-tenant tool filtering: only show tools the caller is allowed to see.
+        {
+            let filter_api_key = extract_bearer_token(&headers);
+            let filter = tokio::task::spawn_blocking(move || {
+                get_tenant_tool_filter(filter_api_key)
+            })
+            .await
+            .unwrap_or(None);
+
+            if let Some(ref patterns) = filter {
+                tools.retain(|t| {
+                    t.get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|name| tool_name_matches_filter(name, patterns))
+                        .unwrap_or(false)
+                });
+            }
+        }
+
+        // Count after tenant restrictions — this is what the caller is allowed to see.
+        let available_count = tools.len();
+
+        // Client-requested filtering: applied after tenant filter so tenant
+        // restrictions cannot be bypassed.
+        //
+        // params.filter.namespace  — only tools in that upstream (e.g. "github")
+        // params.filter.search     — case-insensitive substring in name or description
+        {
+            let client_filter = parsed.get("params").and_then(|p| p.get("filter"));
+
+            if let Some(f) = client_filter {
+                if let Some(ns) = f.get("namespace").and_then(|v| v.as_str()) {
+                    let prefix = format!("{ns}.");
+                    tools.retain(|t| {
+                        t.get("name")
+                            .and_then(|n| n.as_str())
+                            .map(|name| name.starts_with(&prefix) || name == ns)
+                            .unwrap_or(false)
+                    });
+                }
+
+                if let Some(query) = f.get("search").and_then(|v| v.as_str()) {
+                    let q = query.to_lowercase();
+                    tools.retain(|t| {
+                        let name_hit = t.get("name")
+                            .and_then(|n| n.as_str())
+                            .map(|n| n.to_lowercase().contains(&q))
+                            .unwrap_or(false);
+                        let desc_hit = t.get("description")
+                            .and_then(|d| d.as_str())
+                            .map(|d| d.to_lowercase().contains(&q))
+                            .unwrap_or(false);
+                        name_hit || desc_hit
+                    });
+                }
+            }
+        }
+
+        let returned_count = tools.len();
+
         let offset: usize = parsed
             .get("params")
             .and_then(|p| p.get("cursor"))
@@ -2555,7 +3100,11 @@ async fn mcp_root_inner(headers: HeaderMap, body: Bytes, pre_parsed: Option<Valu
             "resultType": "complete",
             "tools": page,
             "ttlMs": MCP_LIST_TTL_MS,
-            "cacheScope": MCP_CACHE_SCOPE
+            "cacheScope": MCP_CACHE_SCOPE,
+            "_kurd": {
+                "available": available_count,
+                "returned": returned_count
+            }
         });
 
         if offset + TOOLS_LIST_PAGE_SIZE < tools.len() {
@@ -2622,6 +3171,31 @@ async fn mcp_root_inner(headers: HeaderMap, body: Bytes, pre_parsed: Option<Valu
                 error.to_string(),
             );
         };
+
+        // -----------------------------------------------------
+        // Policy check: verify caller is allowed to invoke this tool.
+        // Runs before routing so both upstream and local tools are gated.
+        // -----------------------------------------------------
+        {
+            let policy_api_key = extract_bearer_token(&headers);
+            let policy_tool_name = tool_name.to_string();
+            let denial = tokio::task::spawn_blocking(move || {
+                check_policy_sync(policy_api_key, policy_tool_name)
+            })
+            .await
+            .unwrap_or(None);
+
+            if let Some(reason) = denial {
+                POLICY_DENIED_REQUESTS.fetch_add(1, Ordering::Relaxed);
+                return jsonrpc_error(
+                    StatusCode::FORBIDDEN,
+                    request_id,
+                    POLICY_DENIED_ERROR_CODE,
+                    "Forbidden by policy",
+                    Some(serde_json::json!({ "reason": reason })),
+                );
+            }
+        }
 
         // -----------------------------------------------------
         // Gateway routing:

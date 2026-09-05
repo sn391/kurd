@@ -6,12 +6,13 @@ import urllib.request
 
 import pytest
 
-from kurd import Router
+from kurd import Router, TenantManager
 from kurd._kurd import (
     clear_http_bearer_token,
     set_http_bearer_token,
     start_http_gateway,
     stop_http_gateway,
+    clear_policy_callback,
 )
 
 _PORT = 18731
@@ -30,11 +31,15 @@ def _post(payload: dict, token: str | None = None) -> dict:
         return json.loads(resp.read())
 
 
+_router: Router = None
+
+
 @pytest.fixture(scope="module", autouse=True)
 def gateway():
-    router = Router()
+    global _router
+    _router = Router()
 
-    @router.tool(name="add")
+    @_router.tool(name="add")
     async def add(a: int, b: int) -> int:
         return a + b
 
@@ -232,3 +237,87 @@ def test_cors_header_on_post_response():
         k.lower() == "access-control-allow-origin"
         for k in result_resp.keys()
     )
+
+
+# ---------------------------------------------------------------------------
+# Policy engine tests
+# ---------------------------------------------------------------------------
+
+def test_policy_engine_allows_permitted_tool():
+    manager = TenantManager()
+    manager.add_tenant("t1", name="Test Tenant", allowed_tools=["add"], api_key="sk-allow")
+    _router.set_policy_engine(manager)
+    try:
+        result = _post(
+            {"jsonrpc": "2.0", "id": 20, "method": "tools/call",
+             "params": {"name": "add", "arguments": {"a": 1, "b": 2}}},
+            token="sk-allow",
+        )
+        assert "result" in result
+        assert result["result"]["content"][0]["text"] == "3"
+    finally:
+        _router.clear_policy_engine()
+
+
+def test_policy_engine_blocks_forbidden_tool():
+    manager = TenantManager()
+    manager.add_tenant("t2", name="Restricted Tenant", allowed_tools=["other_tool"], api_key="sk-deny")
+    _router.set_policy_engine(manager)
+    try:
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            _post(
+                {"jsonrpc": "2.0", "id": 21, "method": "tools/call",
+                 "params": {"name": "add", "arguments": {"a": 1, "b": 2}}},
+                token="sk-deny",
+            )
+        assert exc_info.value.code == 403
+    finally:
+        _router.clear_policy_engine()
+
+
+def test_policy_engine_blocks_unknown_api_key():
+    manager = TenantManager()
+    manager.add_tenant("t3", name="Other Tenant", allowed_tools=["add"], api_key="sk-other")
+    _router.set_policy_engine(manager)
+    try:
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            _post(
+                {"jsonrpc": "2.0", "id": 22, "method": "tools/call",
+                 "params": {"name": "add", "arguments": {"a": 1, "b": 2}}},
+                token="sk-unknown",
+            )
+        assert exc_info.value.code == 403
+    finally:
+        _router.clear_policy_engine()
+
+
+def test_policy_engine_cleared_allows_all():
+    manager = TenantManager()
+    manager.add_tenant("t4", name="Deny All", allowed_tools=[], api_key="sk-deny-all")
+    _router.set_policy_engine(manager)
+    _router.clear_policy_engine()
+    result = _post(
+        {"jsonrpc": "2.0", "id": 23, "method": "tools/call",
+         "params": {"name": "add", "arguments": {"a": 5, "b": 5}}},
+    )
+    assert "result" in result
+    assert result["result"]["content"][0]["text"] == "10"
+
+
+def test_policy_engine_status_endpoint_reflects_active():
+    manager = TenantManager()
+    manager.add_tenant("t5", name="Status Tenant", api_key="sk-status")
+    _router.set_policy_engine(manager)
+    try:
+        with urllib.request.urlopen(f"{_BASE}/status") as resp:
+            data = json.loads(resp.read())
+        assert data["security"]["policyEnabled"] is True
+    finally:
+        _router.clear_policy_engine()
+
+
+def test_policy_engine_status_endpoint_reflects_inactive():
+    clear_policy_callback()
+    with urllib.request.urlopen(f"{_BASE}/status") as resp:
+        data = json.loads(resp.read())
+    assert data["security"]["policyEnabled"] is False
