@@ -150,7 +150,7 @@ class IdempotencyManager:
             if status == ResultStatus.SUCCESS.value:
                 result = {}
                 if result_json:
-                    result = eval(result_json)  # Safe in this context
+                    result = __import__("json").loads(result_json)
                 return True, {"status": "success", "result": result}
 
             # Return cached error

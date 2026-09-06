@@ -4,6 +4,28 @@ All notable changes to Kurd are documented in this file.
 
 The format is based on Keep a Changelog, and the project follows Semantic Versioning.
 
+## [0.8.0] - 2026-09-06
+
+### Added
+
+- **SSE / Streamable HTTP (`GET /mcp`)** — Clients can now subscribe to `GET /mcp` to receive server-initiated `notifications/tools/list_changed` notifications. All tool and upstream registration events automatically broadcast to connected SSE clients. `initialize` capabilities now advertise `listChanged: true`.
+- **`Mcp-Session-Id` session management** — Every `initialize` response carries a unique `Mcp-Session-Id` header (32-char lowercase hex). Client info and capabilities are stored for the session lifetime with automatic high-watermark eviction at 10,000 sessions.
+- **JSON-RPC batch requests** — POST bodies containing a JSON array are processed as a batch. Each item is dispatched individually and the responses are returned as a JSON array. Empty arrays return a proper JSON-RPC `-32600` error.
+- **Multi-type content in `tools/call`** — Tools can now return MCP content objects directly (`{"type": "image", ...}`, `{"type": "resource", ...}`, etc.) or an array of content objects. Plain string and non-content-object returns are still wrapped in `{"type": "text", "text": ...}` as before.
+- **Upstream response size limit** — Upstream responses larger than 32 MiB are rejected before buffering, with a clear error message. Content-Length is checked before reading the body.
+- **W3C traceparent propagation to upstream** — Every `tools/call` forwarded to an upstream now carries a `traceparent` header derived from the gateway's own span: same `trace_id`, fresh child `span_id`. Uses a Tokio task-local so the context flows transparently without threading it through every call site.
+- **Circuit breaker half-open state** — After the 30-second reset timeout elapses, exactly one probe request is allowed through. All other requests during the probe are rejected with "Circuit half-open". On probe success the circuit fully closes; on probe failure it re-opens immediately with a fresh timeout.
+- **`logging/setLevel` reload handle** — The `tracing_subscriber::reload::Handle` is stored globally and used to mutate the live filter on `logging/setLevel` calls. The previous `std::env::set_var` (undefined behaviour in multithreaded Rust) is removed.
+
+### Fixed
+
+- **Critical: `eval()` in `kurd/idempotency.py`** — Replaced `eval(result_json)` with `json.loads(result_json)`, eliminating a remote code execution vulnerability.
+- **`std::env::set_var` undefined behaviour** — The `logging/setLevel` handler previously called `set_var` in a multithreaded process. Replaced with the `tracing_subscriber::reload` API.
+
+### Validation
+
+- 133 tests passing across 6 test modules (gateway, admin API, tool filtering, tool discovery, OTEL, new features).
+
 ## [0.7.0] - 2026-09-06
 
 ### Added

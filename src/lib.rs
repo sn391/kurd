@@ -4,6 +4,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::net::{IpAddr, SocketAddr};
+use std::convert::Infallible;
 use axum::extract::ConnectInfo;
 use rand::Rng;
 use std::collections::HashMap;
@@ -12,6 +13,7 @@ use axum::{
     extract::{DefaultBodyLimit, Json, Path},
     http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
+    response::sse::{Event, KeepAlive, Sse},
     routing::{delete, get, post},
     Router as AxumRouter,
 };
@@ -20,6 +22,9 @@ use once_cell::sync::Lazy;
 use std::sync::{Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use pyo3::types::PyAnyMethods;
+use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::StreamExt as TokioStreamExt;
+use tracing_subscriber::prelude::*;
 
 
 struct RegisteredTool {
@@ -61,6 +66,7 @@ static ALLOW_PRIVATE_UPSTREAMS: AtomicBool = AtomicBool::new(true);
 static UPSTREAM_TIMEOUT_MS: AtomicU64 = AtomicU64::new(30_000);
 
 const MAX_MCP_BODY_BYTES: usize = 1024 * 1024;
+const MAX_UPSTREAM_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
 // Production backpressure defaults. All are configurable from Python.
 static GLOBAL_CONCURRENCY_LIMIT: AtomicU64 = AtomicU64::new(512);
@@ -95,6 +101,34 @@ static RATE_LIMIT_REQUESTS: Lazy<Mutex<HashMap<String, Vec<u64>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 static RATE_LIMIT_LAST_CLEANUP_MS: AtomicU64 = AtomicU64::new(0);
+
+// SSE channels for Streamable HTTP — one sender per connected client.
+static SSE_CHANNELS: Lazy<Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<String>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+// Session registry: Mcp-Session-Id → client metadata.
+#[allow(dead_code)]
+struct McpSession {
+    client_info: Value,
+    client_capabilities: Value,
+}
+
+static SESSION_REGISTRY: Lazy<RwLock<HashMap<String, McpSession>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+// Tracing filter reload handle — lets logging/setLevel actually take effect.
+type FilterReloadHandle = tracing_subscriber::reload::Handle<
+    tracing_subscriber::EnvFilter,
+    tracing_subscriber::Registry,
+>;
+static LOG_FILTER_HANDLE: Lazy<Mutex<Option<FilterReloadHandle>>> =
+    Lazy::new(|| Mutex::new(None));
+
+// Task-local W3C traceparent for the current MCP request, used when propagating
+// trace context to upstream calls inside the same Tokio task.
+tokio::task_local! {
+    static TASK_TRACEPARENT: String;
+}
 
 // Latency histogram buckets (ms). +Inf is the implicit last slot.
 const LATENCY_BUCKETS: [u64; 11] = [1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000];
@@ -561,6 +595,8 @@ static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
 struct CircuitState {
     failures: u32,
     opened_at: Option<Instant>,
+    // true while a single probe request is in-flight after the reset timeout.
+    half_open: bool,
 }
 
 static CIRCUIT_BREAKERS: Lazy<RwLock<HashMap<String, CircuitState>>> =
@@ -1073,24 +1109,35 @@ async fn forward_to_upstream(
             .or_insert(CircuitState {
                 failures: 0,
                 opened_at: None,
+                half_open: false,
             });
 
         if let Some(opened_at) = state.opened_at {
             if opened_at.elapsed() < CIRCUIT_RESET_TIMEOUT {
+                // Circuit is fully open: reject all requests.
                 if let Ok(mut metrics) = UPSTREAM_METRICS.write() {
                     metrics
                         .entry(upstream_name.to_string())
                         .or_default()
                         .failures += 1;
                 }
-
-                return Err(format!(
-                    "Circuit open for upstream: {upstream_name}"
-                ));
+                return Err(format!("Circuit open for upstream: {upstream_name}"));
             }
 
-            state.failures = 0;
-            state.opened_at = None;
+            // Reset timeout elapsed — allow exactly one probe request.
+            if state.half_open {
+                // Probe already in flight: reject this request.
+                if let Ok(mut metrics) = UPSTREAM_METRICS.write() {
+                    metrics
+                        .entry(upstream_name.to_string())
+                        .or_default()
+                        .failures += 1;
+                }
+                return Err(format!("Circuit half-open for upstream: {upstream_name}"));
+            }
+
+            // Mark probe in-flight; do not reset failure count until probe succeeds.
+            state.half_open = true;
         }
     }
 
@@ -1123,6 +1170,15 @@ async fn forward_to_upstream(
             }
         }
 
+        // Propagate W3C trace context: create a child span for this upstream hop.
+        if let Ok(parent_tp) = TASK_TRACEPARENT.try_with(|t| t.clone()) {
+            let parts: Vec<&str> = parent_tp.split('-').collect();
+            if parts.len() >= 4 {
+                let child_tp = format!("00-{}-{}-01", parts[1], generate_hex_id(8));
+                request = request.header("traceparent", child_tp);
+            }
+        }
+
         let response = request
             .json(payload)
             .send()
@@ -1133,17 +1189,32 @@ async fn forward_to_upstream(
                 let status = response.status();
 
                 if status.is_success() {
-                    let value = response
-                        .json::<Value>()
-                        .await
+                    // Enforce response size limit before buffering.
+                    if let Some(cl) = response.content_length() {
+                        if cl > MAX_UPSTREAM_RESPONSE_BYTES as u64 {
+                            return Err(format!(
+                                "Upstream response too large: {cl} bytes (max {MAX_UPSTREAM_RESPONSE_BYTES})"
+                            ));
+                        }
+                    }
+                    let bytes = response.bytes().await.map_err(|e| e.to_string())?;
+                    if bytes.len() > MAX_UPSTREAM_RESPONSE_BYTES {
+                        return Err(format!(
+                            "Upstream response too large: {} bytes (max {MAX_UPSTREAM_RESPONSE_BYTES})",
+                            bytes.len()
+                        ));
+                    }
+                    let value = serde_json::from_slice::<Value>(&bytes)
                         .map_err(|e| e.to_string())?;
 
+                    // Probe or normal success — fully close the circuit.
                     if let Ok(mut breakers) = CIRCUIT_BREAKERS.write() {
                         breakers.insert(
                             upstream_name.to_string(),
                             CircuitState {
                                 failures: 0,
                                 opened_at: None,
+                                half_open: false,
                             },
                         );
                     }
@@ -1207,12 +1278,15 @@ async fn forward_to_upstream(
             .or_insert(CircuitState {
                 failures: 0,
                 opened_at: None,
+                half_open: false,
             });
 
         state.failures += 1;
 
-        if state.failures >= CIRCUIT_FAILURE_THRESHOLD {
+        // Half-open probe failure: re-open immediately without waiting for the threshold.
+        if state.half_open || state.failures >= CIRCUIT_FAILURE_THRESHOLD {
             state.opened_at = Some(Instant::now());
+            state.half_open = false;
         }
     }
 
@@ -1272,6 +1346,7 @@ fn unregister_upstream(name: String) -> PyResult<bool> {
         }
 
         invalidate_tools_cache();
+        notify_tools_changed();
     }
 
     Ok(removed)
@@ -1496,6 +1571,7 @@ fn register_upstream(
     drop(upstreams);
 
     invalidate_tools_cache();
+    notify_tools_changed();
 
     Ok(())
 }
@@ -1588,6 +1664,7 @@ fn unregister_tool(name: String) -> PyResult<bool> {
 
     if removed {
         invalidate_tools_cache();
+        notify_tools_changed();
     }
 
     Ok(removed)
@@ -1624,6 +1701,8 @@ fn register_tool(
             callback: callback.clone_ref(py),
         },
     );
+    drop(tools);
+    notify_tools_changed();
 
     Ok(())
 }
@@ -1735,6 +1814,7 @@ async fn admin_add_server(headers: HeaderMap, Json(body): Json<AddServerRequest>
             registry.insert(body.name.clone(), body.url.clone());
             if let Ok(mut cache) = TOOLS_CACHE.write() { *cache = None; }
             if let Ok(mut metrics) = TOOLS_CACHE_METRICS.write() { metrics.invalidations += 1; }
+            notify_tools_changed();
             let status = if replaced { StatusCode::OK } else { StatusCode::CREATED };
             (status, Json(serde_json::json!({"name": body.name, "url": body.url, "replaced": replaced}))).into_response()
         }
@@ -1752,6 +1832,7 @@ async fn admin_delete_server(headers: HeaderMap, Path(name): Path<String>) -> im
             if registry.remove(&name).is_some() {
                 if let Ok(mut cache) = TOOLS_CACHE.write() { *cache = None; }
                 if let Ok(mut metrics) = TOOLS_CACHE_METRICS.write() { metrics.invalidations += 1; }
+                notify_tools_changed();
                 (StatusCode::OK, Json(serde_json::json!({"deleted": name}))).into_response()
             } else {
                 (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": format!("Server not found: {name}")}))).into_response()
@@ -1809,6 +1890,7 @@ async fn admin_reload_tools(headers: HeaderMap) -> impl IntoResponse {
 
     if let Ok(mut cache) = TOOLS_CACHE.write() { *cache = None; }
     if let Ok(mut metrics) = TOOLS_CACHE_METRICS.write() { metrics.invalidations += 1; }
+    notify_tools_changed();
 
     (StatusCode::OK, Json(serde_json::json!({"reloaded": true}))).into_response()
 }
@@ -1836,12 +1918,58 @@ async fn admin_list_namespaces(headers: HeaderMap) -> impl IntoResponse {
     (StatusCode::OK, Json(serde_json::json!({"namespaces": namespaces, "count": namespaces.len()}))).into_response()
 }
 
+/// GET /mcp — Streamable HTTP SSE endpoint per MCP 2026-07-28 spec.
+/// Clients subscribe here to receive server-initiated notifications
+/// (e.g. notifications/tools/list_changed).
+async fn mcp_sse(headers: HeaderMap) -> impl IntoResponse {
+    let session_id = headers
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .unwrap_or_else(|| generate_hex_id(16));
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    if let Ok(mut channels) = SSE_CHANNELS.lock() {
+        // Remove stale (closed) channels when we grow large.
+        if channels.len() > 500 {
+            channels.retain(|_, sender| !sender.is_closed());
+        }
+        channels.insert(session_id, tx);
+    }
+
+    let stream = UnboundedReceiverStream::new(rx)
+        .map(|data| Ok::<Event, Infallible>(Event::default().data(data)));
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// Broadcast a notifications/tools/list_changed notification to all SSE subscribers.
+fn notify_tools_changed() {
+    let channels = match SSE_CHANNELS.lock() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    if channels.is_empty() {
+        return;
+    }
+    let notification = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/tools/list_changed",
+        "params": {}
+    })
+    .to_string();
+    for tx in channels.values() {
+        let _ = tx.send(notification.clone());
+    }
+}
+
 fn build_http_router() -> AxumRouter {
     AxumRouter::new()
         .route("/health", get(health))
         .route("/status", get(status))
         .route("/metrics", get(metrics_prometheus))
-        .route("/mcp", post(mcp_root).options(mcp_options))
+        .route("/mcp", get(mcp_sse).post(mcp_root).options(mcp_options))
         .route("/admin/servers", get(admin_list_servers).post(admin_add_server))
         .route("/admin/servers/{name}", delete(admin_delete_server))
         .route("/admin/tools", get(admin_list_tools))
@@ -1883,13 +2011,21 @@ fn start_http_gateway(py: Python<'_>, addr: String) -> PyResult<()> {
     py.detach(|| {
         // Install a default subscriber if the host hasn't set one up yet.
         // Respects RUST_LOG / KURD_LOG env vars; falls back to info-level.
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_env("KURD_LOG")
-                    .or_else(|_| tracing_subscriber::EnvFilter::try_from_default_env())
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("kurd=info")),
-            )
+        // Uses a reload::Layer so logging/setLevel can change the filter at runtime.
+        let initial_filter = tracing_subscriber::EnvFilter::try_from_env("KURD_LOG")
+            .or_else(|_| tracing_subscriber::EnvFilter::try_from_default_env())
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("kurd=info"));
+        let (filter_layer, reload_handle) =
+            tracing_subscriber::reload::Layer::new(initial_filter);
+        let init_result = tracing_subscriber::registry()
+            .with(filter_layer)
+            .with(tracing_subscriber::fmt::layer())
             .try_init();
+        // On subsequent gateway starts the global is already set; that is fine.
+        let _ = init_result;
+        if let Ok(mut h) = LOG_FILTER_HANDLE.lock() {
+            *h = Some(reload_handle);
+        }
 
         // Auto-load bearer token from environment if not already configured.
         if let Ok(token) = std::env::var("KURD_AUTH_TOKEN") {
@@ -2202,6 +2338,7 @@ async fn metrics_prometheus() -> impl IntoResponse {
             let breaker = breakers.get(name).copied().unwrap_or(CircuitState {
                 failures: 0,
                 opened_at: None,
+                half_open: false,
             });
             let state = match breaker.opened_at {
                 Some(opened_at) if opened_at.elapsed() < CIRCUIT_RESET_TIMEOUT => 1,
@@ -2333,6 +2470,7 @@ async fn status() -> impl IntoResponse {
         let breaker = breakers.get(&name).copied().unwrap_or(CircuitState {
             failures: 0,
             opened_at: None,
+            half_open: false,
         });
 
         let circuit = match breaker.opened_at {
@@ -2711,8 +2849,92 @@ async fn mcp_root(
         .map(|(tid, pid)| (tid, Some(pid)))
         .unwrap_or_else(|| (generate_hex_id(16), None));
     let otel_span_id = generate_hex_id(8);
+    // Build the W3C traceparent for this gateway span, propagated to upstream calls.
+    let current_traceparent = format!("00-{otel_trace_id}-{otel_span_id}-01");
 
-    let mut response = mcp_root_inner(headers, body, pre_parsed).await.into_response();
+    // Extract session-relevant fields before pre_parsed is consumed.
+    let is_initialize = method.as_deref() == Some("initialize");
+    let (session_client_info, session_client_caps) = if is_initialize {
+        (
+            pre_parsed.as_ref()
+                .and_then(|v| v.get("params"))
+                .and_then(|p| p.get("clientInfo"))
+                .cloned()
+                .unwrap_or(Value::Null),
+            pre_parsed.as_ref()
+                .and_then(|v| v.get("params"))
+                .and_then(|p| p.get("capabilities"))
+                .cloned()
+                .unwrap_or(Value::Null),
+        )
+    } else {
+        (Value::Null, Value::Null)
+    };
+
+    // JSON-RPC batch: array of request objects processed sequentially.
+    let is_batch = matches!(&pre_parsed, Some(Value::Array(_)));
+    let mut response = if is_batch {
+        let batch_items = match pre_parsed {
+            Some(Value::Array(items)) => items,
+            _ => unreachable!(),
+        };
+        if batch_items.is_empty() {
+            jsonrpc_error(StatusCode::OK, Value::Null, -32600, "Empty batch array", None)
+                .into_response()
+        } else {
+            let mut batch_responses: Vec<Value> = Vec::with_capacity(batch_items.len());
+            for item in &batch_items {
+                let item_body = Bytes::from(item.to_string().into_bytes());
+                let item_response = TASK_TRACEPARENT
+                    .scope(
+                        current_traceparent.clone(),
+                        mcp_root_inner(headers.clone(), item_body, Some(item.clone())),
+                    )
+                    .await
+                    .into_response();
+                let item_bytes = axum::body::to_bytes(item_response.into_body(), MAX_MCP_BODY_BYTES)
+                    .await
+                    .unwrap_or_default();
+                if let Ok(v) = serde_json::from_slice::<Value>(&item_bytes) {
+                    batch_responses.push(v);
+                }
+            }
+            axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(Value::Array(batch_responses).to_string()))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+    } else {
+        TASK_TRACEPARENT
+            .scope(
+                current_traceparent.clone(),
+                mcp_root_inner(headers, body, pre_parsed),
+            )
+            .await
+            .into_response()
+    };
+
+    // For initialize: create a session and return Mcp-Session-Id in the response.
+    if is_initialize {
+        let session_id = generate_hex_id(16);
+        if let Ok(mut sessions) = SESSION_REGISTRY.write() {
+            // Simple high-watermark eviction to prevent unbounded growth.
+            if sessions.len() >= 10_000 {
+                sessions.clear();
+            }
+            sessions.insert(
+                session_id.clone(),
+                McpSession {
+                    client_info: session_client_info,
+                    client_capabilities: session_client_caps,
+                },
+            );
+        }
+        if let Ok(hv) = HeaderValue::from_str(&session_id) {
+            response.headers_mut().insert("mcp-session-id", hv);
+        }
+    }
 
     let otel_end_ns = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as u64;
     let otel_status_code = response.status().as_u16();
@@ -2889,7 +3111,7 @@ async fn mcp_root_inner(headers: HeaderMap, body: Bytes, pre_parsed: Option<Valu
             "result": {
                 "protocolVersion": MCP_PROTOCOL_VERSION,
                 "capabilities": {
-                    "tools": { "listChanged": false },
+                    "tools": { "listChanged": true },
                     "resources": { "subscribe": false, "listChanged": false },
                     "prompts": { "listChanged": false },
                     "logging": {}
@@ -3346,12 +3568,30 @@ async fn mcp_root_inner(headers: HeaderMap, body: Bytes, pre_parsed: Option<Valu
 
         match serialized {
             Ok(serialized) => {
-                // Parse into a Value so we can tell whether the tool returned
-                // a JSON string (needs no extra quoting) vs. another type.
-                let text = match serde_json::from_str::<Value>(&serialized) {
-                    Ok(Value::String(s)) => s,          // already a plain string
-                    Ok(other)            => other.to_string(), // number, bool, array, object
-                    Err(_)               => serialized,        // not valid JSON — use raw
+                // Build content array, respecting MCP multi-type content objects.
+                // Tools may return: a plain string, a content object {type,…},
+                // an array of content objects, or any other JSON value.
+                let content: Vec<Value> = match serde_json::from_str::<Value>(&serialized) {
+                    Ok(Value::String(s)) => {
+                        vec![serde_json::json!({"type": "text", "text": s})]
+                    }
+                    Ok(Value::Object(obj)) if obj.contains_key("type") => {
+                        // Already a content object (e.g. image, resource, audio).
+                        vec![Value::Object(obj)]
+                    }
+                    Ok(Value::Array(arr))
+                        if !arr.is_empty()
+                            && arr.iter().all(|v| v.get("type").is_some()) =>
+                    {
+                        // Already an array of content objects.
+                        arr
+                    }
+                    Ok(other) => {
+                        vec![serde_json::json!({"type": "text", "text": other.to_string()})]
+                    }
+                    Err(_) => {
+                        vec![serde_json::json!({"type": "text", "text": serialized})]
+                    }
                 };
 
                 let response = serde_json::json!({
@@ -3359,12 +3599,7 @@ async fn mcp_root_inner(headers: HeaderMap, body: Bytes, pre_parsed: Option<Valu
                     "id": request_id,
                     "result": {
                         "resultType": "complete",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": text
-                            }
-                        ],
+                        "content": content,
                         "isError": false
                     }
                 });
@@ -3501,7 +3736,7 @@ async fn mcp_root_inner(headers: HeaderMap, body: Bytes, pre_parsed: Option<Valu
             .and_then(|l| l.as_str())
             .unwrap_or("info");
 
-        // Best-effort: reload the global tracing env-filter.
+        // Apply the new level to the live tracing filter via the reload handle.
         let filter_str = match level {
             "debug" | "verbose" => "kurd=debug",
             "info"  | "notice"  => "kurd=info",
@@ -3509,7 +3744,12 @@ async fn mcp_root_inner(headers: HeaderMap, body: Bytes, pre_parsed: Option<Valu
             "error" | "critical"| "alert" | "emergency" => "kurd=error",
             _                   => "kurd=info",
         };
-        let _ = std::env::set_var("KURD_LOG", filter_str);
+        if let Ok(guard) = LOG_FILTER_HANDLE.lock() {
+            if let Some(ref handle) = *guard {
+                let new_filter = tracing_subscriber::EnvFilter::new(filter_str);
+                let _ = handle.modify(|f| *f = new_filter);
+            }
+        }
 
         let response = serde_json::json!({
             "jsonrpc": "2.0",
