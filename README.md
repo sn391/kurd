@@ -1,4 +1,5 @@
 # Kurd MCP
+# Kernel for Unified Resilient Dispatch
 
 [![PyPI](https://img.shields.io/pypi/v/kurd)](https://pypi.org/project/kurd/)
 [![Python](https://img.shields.io/pypi/pyversions/kurd)](https://pypi.org/project/kurd/)
